@@ -33,7 +33,8 @@ defaults:
 work_dir: ${hydra:runtime.cwd}
 
 # path to folder with data
-data_dir: ${work_dir}/data/
+#data_dir: ${work_dir}/data/
+data_dir: /mnt/nfs-ssd/raw-datasets/torchvision-format/
 
 # pretty print config at the start of the run using Rich library
 print_config: True

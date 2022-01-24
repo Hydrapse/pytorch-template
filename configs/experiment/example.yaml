@@ -9,14 +9,14 @@ defaults:
   - override /model: mnist.yaml
   - override /datamodule: mnist.yaml
   - override /callbacks: default.yaml
-  - override /logger: null
+  - override /logger: mlflow
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
 # name of the run determines folder name in logs
 # can also be accessed by loggers
-name: "example"
+name: "dgd-example"
 
 seed: 12345
 
@@ -26,17 +26,22 @@ trainer:
   gradient_clip_val: 0.5
 
 model:
-  lin1_size: 128
-  lin2_size: 256
-  lin3_size: 64
-  lr: 0.002
+  lin1_size: 512
+  lin2_size: 512
+  lin3_size: 512
+  lr: 0.001
 
 datamodule:
   batch_size: 64
   train_val_test_split: [55_000, 5_000, 10_000]
 
+# 覆盖掉logger配置
 logger:
-  csv:
-    name: csv/${name}
-  wandb:
-    tags: ["mnist", "simple_dense_net"]
+  mlflow:
+    run_name: run2  # 指定实验名
+
+#logger:
+#  csv:
+#    name: csv/${name}
+#  wandb:
+#    tags: ["mnist", "simple_dense_net"]

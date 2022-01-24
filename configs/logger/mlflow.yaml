@@ -3,8 +3,9 @@
 mlflow:
   _target_: pytorch_lightning.loggers.mlflow.MLFlowLogger
   experiment_name: ${name}
-  tracking_uri: null
-  tags: null
+  tracking_uri: http://106.55.173.219:18885/
+  tags:
+    mlflow.user: dgd
   save_dir: ./mlruns
   prefix: ""
   artifact_location: null
