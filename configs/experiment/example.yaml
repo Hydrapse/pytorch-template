@@ -9,14 +9,16 @@ defaults:
   - override /model: mnist.yaml
   - override /datamodule: mnist.yaml
   - override /callbacks: default.yaml
-  - override /logger: mlflow
+  - override /logger:
+    - neptune.yaml
+#    - mlflow.yaml
 
 # all parameters below will be merged with parameters from default configurations set above
 # this allows you to overwrite only specified parameters
 
 # name of the run determines folder name in logs
 # can also be accessed by loggers
-name: "dgd-example"
+name: "example"
 
 seed: 12345
 
@@ -24,11 +26,13 @@ trainer:
   min_epochs: 1
   max_epochs: 10
   gradient_clip_val: 0.5
+  gpus: 3
+  strategy: ddp
 
 model:
-  lin1_size: 512
-  lin2_size: 512
-  lin3_size: 512
+  lin1_size: 32
+  lin2_size: 32
+  lin3_size: 64
   lr: 0.001
 
 datamodule:
@@ -36,9 +40,9 @@ datamodule:
   train_val_test_split: [55_000, 5_000, 10_000]
 
 # 覆盖掉logger配置
-logger:
-  mlflow:
-    run_name: run2  # 指定实验名
+#logger:
+#  mlflow:
+#    run_name: run3  # 指定实验名
 
 #logger:
 #  csv:

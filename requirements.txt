@@ -7,14 +7,14 @@ torchmetrics>=0.6.0
 # --------- hydra --------- #
 hydra-core==1.1.0
 hydra-colorlog==1.1.0
-hydra-optuna-sweeper==1.1.0
+hydra-optuna-sweeper==1.1.2
 # hydra-ax-sweeper
 # hydra-ray-launcher
 # hydra-submitit-launcher
 
 # --------- loggers --------- #
 wandb
-# neptune-client
+neptune-client
 mlflow
 # comet-ml
 # torch_tb_profiler
