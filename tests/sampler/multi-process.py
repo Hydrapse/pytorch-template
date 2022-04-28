@@ -1,3 +1,8 @@
+from torch.utils.data import DataLoader
+
+from src.models.components.assort_sampler import AdaptiveSampler
+
+
 def sample_sub_graphs(batch_nodes, thresholds, model_s, q):
     ego_graphs = []
     for i in range(batch_nodes.shape[-1]):

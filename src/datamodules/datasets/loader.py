@@ -31,20 +31,21 @@ class SetEgoPtr(BaseTransform):
 
 
 # PYG Batch Data Transform
-transform = T.Compose([T.ToSparseTensor(), SetEgoPtr()])
+base_trans = [T.ToSparseTensor(), SetEgoPtr()]
 to_sparse, set_ego = T.ToSparseTensor(), SetEgoPtr()
 
 
 class NeighborLoader(NeighborL):
 
     def __init__(self, data, **kwargs):
-        super().__init__(data, transform=transform, **kwargs)
+        super().__init__(data, transform=T.Compose(base_trans), **kwargs)
 
 
 class ClusterLoader(ClusterL):
 
     def __collate__(self, batch):
         data = super().__collate__(batch)
+        transform = T.Compose(base_trans)
         return transform(data)
 
 
@@ -52,6 +53,7 @@ class SaintRwLoader(GraphSAINTRandomWalkSampler):
 
     def __collate__(self, data_list):
         data = super().__collate__(data_list)
+        transform = T.Compose(base_trans)
         return transform(data)
 
 
@@ -69,16 +71,24 @@ class EgoGraphLoader(DataLoader):
 
     def __init__(self, node_idx: Optional[Tensor],
                  collator: AdaptiveSampler = None,
-                 # is_eval: bool = False,
+                 undirected: bool = False,
                  **kwargs):
         self.collator = collator
+        self.undirected = undirected
 
         if node_idx.dtype == torch.bool:
             node_idx = node_idx.nonzero(as_tuple=False).view(-1)
         self.node_idx = node_idx
 
-        # if is_eval:
-        #     kwargs['batch_size'] = node_idx.size(0)
-        #     print(kwargs['batch_size'])
+        super().__init__(node_idx.tolist(), collate_fn=self.__collate__, **kwargs)
 
-        super().__init__(node_idx.tolist(), collate_fn=self.collator, **kwargs)
+    def __collate__(self, batch_nodes):
+        batch_data = self.collator(batch_nodes)
+
+        trans = [T.AddSelfLoops()]
+        if self.undirected:
+            trans.append(T.ToUndirected())
+        transform = T.Compose(trans + base_trans)
+        return transform(batch_data)
+
+

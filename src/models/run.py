@@ -1,9 +1,7 @@
 import sys
-import os
+import time
 
-curPath = os.path.abspath(os.path.dirname('/home/xhh/notebooks/GNN/pytorch-template/notebooks/'))
-rootPath = os.path.split(curPath)[0]
-sys.path.append(rootPath)
+sys.path.append('/home/xhh/notebooks/GNN/pytorch-template')
 
 from src.models.components.assort_sampler import AdaptiveSampler
 from torch_geometric.nn import SAGEConv, global_mean_pool, GCNConv
@@ -21,21 +19,25 @@ from src.datamodules.datasets.data import get_data
 from src.datamodules.datasets.loader import EgoGraphLoader
 from src.utils.index import setup_seed
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+torch.autograd.set_detect_anomaly(True)
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
 
 data, num_features, num_classes, processed_dir = get_data('cora', split='full')
 
 kwargs = {'batch_size': 70,
           # 'num_workers': 0,
           # 'persistent_workers': False,
-          # 'pin_memory': True,
+          'pin_memory': False,
+          'shuffle': True,
+          'undirected': False
           }
 
-sampler = AdaptiveSampler(data, 50, max_hop=10, alpha=0.5)
+sampler = AdaptiveSampler(data, 50, max_hop=10, alpha=0.7, p_gather='mean',
+                          num_groups=1, group_type='full', ego_mode=True)
 
-train_loader = EgoGraphLoader(data.train_mask, sampler, shuffle=True, **kwargs)
-val_loader = EgoGraphLoader(data.val_mask, sampler, **kwargs)
-test_loader = EgoGraphLoader(data.test_mask, sampler, **kwargs)
+train_loader = EgoGraphLoader(data.train_mask, sampler, **kwargs)
+val_loader = EgoGraphLoader(data.val_mask, sampler, num_workers=0, persistent_workers=False, **kwargs)
+test_loader = EgoGraphLoader(data.test_mask, sampler, num_workers=0, persistent_workers=False, **kwargs)
 
 
 class GNN(torch.nn.Module):
@@ -56,9 +58,9 @@ class GNN(torch.nn.Module):
 
         for i, conv in enumerate(self.convs):
             x = conv(x, adj_t)
-            if i < len(self.convs):
+            if i < len(self.convs) - 1:
                 x = x.relu_()
-                x = F.dropout(x, p=0.6, training=self.training)
+                x = F.dropout(x, p=0.3, training=self.training)
 
         # x = x * p
         x = torch.cat([x[root_ptr], global_mean_pool(x * p, batch)], dim=-1)
@@ -91,7 +93,7 @@ def train(epoch):
         loss = F.cross_entropy(out, batch.y)
         loss.backward()
 
-        # print(f'threshold: {sampler.w_threshold.grad}, ego: {sampler.w_ego_u}')
+        # print(f'layer: {sampler.w_layer_u.grad}, ego: {sampler.w_ego_u}')
         optimizer.step()
         total_loss += float(loss) * batch.num_graphs
         total_examples += batch.num_graphs
@@ -113,12 +115,11 @@ def train(epoch):
 
 @torch.no_grad()
 def test(loader):
+    sampler.eval()
     model.eval()
     total_correct = total_examples = 0
-    edges = []
     for i, batch in enumerate(loader):
         batch = batch.to(device)
-        edges.append(batch.num_edges)
 
         out = model(batch.x, batch.adj_t, batch.p, batch.batch, batch.ego_ptr)
 
@@ -127,7 +128,6 @@ def test(loader):
         total_examples += batch.num_graphs
         # print(i, correct / batch.num_graphs)
 
-    # print(f'Avg Edges {sum(edges)/len(edges):.2f}')
     return total_correct / total_examples
 
 
@@ -139,12 +139,14 @@ def main():
         train_loss = train(epoch)
 
         if epoch % 1 == 0:
+            start_time = time.perf_counter()
             val_acc = test(val_loader)
             tmp_test_acc = test(test_loader)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 test_acc = tmp_test_acc
-            print(f'Epoch: {epoch:02d}, Val: {best_val_acc:.4f}, Test: {test_acc:.4f}')
+            print(f'Epoch: {epoch:02d}, Val: {best_val_acc:.4f}, Test: {test_acc:.4f}, '
+                  f'Time:{time.perf_counter() - start_time:.2f}s')
 
 
 if __name__ == '__main__':
