@@ -1,3 +1,4 @@
+import copy
 import sys
 import time
 
@@ -58,7 +59,7 @@ class GNN(torch.nn.Module):
         return x
 
 
-def train(epoch, loader, model, optimizer, device):
+def train(epoch, loader, model, optimizer, device, sampler):
     model.train()
 
     pbar = tqdm(total=int(len(loader.dataset)))
@@ -75,9 +76,16 @@ def train(epoch, loader, model, optimizer, device):
         out = model(batch.x, batch.adj_t, batch.p, batch.batch, batch.ego_ptr)
         loss = F.cross_entropy(out, batch.y)
         loss.backward()
+        # temp_w = copy.copy(sampler.w_ego_root[0])
+        # temp_m = copy.copy(model.lin.weight)
+        # print(model.lin.weight)
+        # print(sampler.w_ego_root[0])
 
         # print(f'layer: {sampler.w_layer_u.grad}, ego: {sampler.w_ego_u}')
         optimizer.step()
+        # print(torch.equal(temp_w, sampler.w_ego_root[0]))
+        # print(torch.equal(temp_m, model.lin.weight))
+
         total_loss += float(loss) * batch.num_graphs
         total_correct += int((out.argmax(dim=-1) == batch.y).sum())
         total_examples += batch.num_graphs
@@ -116,7 +124,7 @@ def test(loader, model, device):
 
 
 def main():
-    runs, epochs, seed = 5, 10, -1
+    runs, epochs, seed = 5, 20, 123
     setup_seed(seed)
 
     torch.autograd.set_detect_anomaly(False)
@@ -124,7 +132,7 @@ def main():
 
     data, num_features, num_classes, processed_dir = get_data('cora', split='full')
 
-    kwargs = {'batch_size': 10,
+    kwargs = {'batch_size': 70,
               # 'num_workers': 0,
               # 'persistent_workers': False,
               'pin_memory': False,
@@ -132,8 +140,8 @@ def main():
               'undirected': False
               }
 
-    sampler = AdaptiveSampler(data, 50, max_hop=10, min_nodes=70, p_gather='mean',
-                              num_groups=1, group_type='full', ego_mode=False)
+    sampler = AdaptiveSampler(data, 50, max_hop=10,  alpha=1e-2, min_nodes=70,
+                              p_gather='mean', num_groups=1, group_type='full', ego_mode=False)
 
     train_loader = EgoGraphLoader(data.train_mask, sampler, **kwargs)
     val_loader = EgoGraphLoader(data.val_mask, sampler, num_workers=0, persistent_workers=False, **kwargs)
@@ -143,7 +151,6 @@ def main():
     # params = list(sampler.parameters()) + list(model.parameters())
     # optimizer = torch.optim.Adam(params, lr=0.01, weight_decay=0)
 
-
     best_val, best_test = [], []
     for i in range(1, runs + 1):
         sampler.reset_parameters()
@@ -151,17 +158,18 @@ def main():
         # params = list(sampler.parameters()) + list(model.parameters())
         # optimizer = torch.optim.Adam(params, lr=0.001, weight_decay=0)
         optimizer = torch.optim.Adam(
-            [{'params': sampler.parameters(), 'lr': 0.005}, {'params': model.parameters(), 'lr': 0.005}])
+            [{'params': sampler.parameters(), 'lr': 0.01, 'weight_decay': 1e-4},
+             {'params': model.parameters(), 'lr': 0.001}])
 
         print(f'------------------------{i}------------------------')
         best_val_acc = best_test_acc = 0
         for epoch in range(1, epochs+1):
             # sampler.min_nodes = 70
             # sampler.max_hop = 3
-            train_loss, train_acc = train(epoch, train_loader, model, optimizer, device)
+            train_loss, train_acc = train(epoch, train_loader, model, optimizer, device, sampler)
             # sampler.max_hop = 10
             # sampler.min_nodes = 0
-            if epoch % 1 == 0 and epoch > 3:
+            if epoch % 1 == 0 and epoch > 2:
                 start_time = time.perf_counter()
                 val_acc, val_hop = test(val_loader, model, device)
                 tmp_test_acc, test_hop = test(test_loader, model, device)
