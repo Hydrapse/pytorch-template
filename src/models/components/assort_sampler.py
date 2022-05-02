@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 import torch_geometric.transforms
 from torch import nn
-from torch.nn import Parameter
+from torch.nn import Parameter, init
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch import Tensor
@@ -34,6 +34,7 @@ class AdaptiveSampler(nn.Module):
             alpha: float = 0.5,
             p_gather: str = 'sum',  # sum, mean, max, min
             max_hop: int = 10,
+            min_nodes: int = 10,  # 最小下一层节点数
             num_groups: int = 2,
             group_type: str = 'full',  # full, split
             ego_mode: bool = False  # 使用比较慢的ego-wise构造rootgraph
@@ -55,6 +56,7 @@ class AdaptiveSampler(nn.Module):
         self.a = alpha
         self.p_gather = p_gather
         self.max_hop = max_hop
+        self.min_nodes = min_nodes
         self.num_groups = num_groups
         self.group_type = group_type
         self.ego_mode = ego_mode
@@ -78,25 +80,27 @@ class AdaptiveSampler(nn.Module):
         self.w_threshold = []
 
         for g in range(self.num_groups):
-            self.w_ego_root.append(Parameter(torch.Tensor(self.num_features[g])))
-            self.w_ego_u.append(Parameter(torch.Tensor(self.num_features[g])))
-            self.w_layer_v.append(Parameter(torch.Tensor(self.num_features[g], 1)))
-            self.w_layer_u.append(Parameter(torch.Tensor(self.num_features[g], 1)))
-            self.w_threshold.append(Parameter(torch.Tensor(self.num_features[g], 1)))
+            self.w_ego_root.append(Parameter(torch.empty(self.num_features[g])))
+            self.w_ego_u.append(Parameter(torch.empty(self.num_features[g])))
+            self.w_layer_v.append(Parameter(torch.empty(self.num_features[g], 1)))
+            self.w_layer_u.append(Parameter(torch.empty(self.num_features[g], 1)))
+            self.w_threshold.append(Parameter(torch.empty(self.num_features[g], 1)))
 
         self.reset_parameters()
 
     def reset_parameters(self):
         for g in range(self.num_groups):
             bound = 1.0 / math.sqrt(self.num_features[g])
-            # for w in [self.w_ego_u[g], self.w_ego_root[g], self.w_layer_u[g], self.w_layer_v[g]]:
+            for w in [self.w_ego_u[g], self.w_ego_root[g], self.w_layer_u[g], self.w_layer_v[g]]:
+                init.uniform_(w.data, -bound, bound)
+
+            # for w in [self.w_ego_u[g], self.w_ego_root[g]]:
             #     torch.nn.init.uniform_(w.data, -bound, bound)
-            for w in [self.w_ego_u[g], self.w_ego_root[g]]:
-                torch.nn.init.uniform_(w.data, -bound, bound)
-            for w in [self.w_layer_u[g], self.w_layer_v[g]]:
-                torch.nn.init.uniform_(w.data, -bound, bound)
+            # for w in [self.w_layer_u[g], self.w_layer_v[g]]:
+            #     w.reset_parameters()
+
             for w in [self.w_threshold[g]]:
-                torch.nn.init.zeros_(w)
+                init.uniform_(w.data, -bound, bound)
                 # torch.nn.init.uniform_(w, 0, 1e-6)
 
     def forward(self, batch_nodes):
@@ -116,11 +120,12 @@ class AdaptiveSampler(nn.Module):
     def batch_wise_sampling(self, batch_nodes, x, g):
         batch_size = len(batch_nodes)
         h_roots = x[batch_nodes] * self.w_ego_root[g]
-        # thresholds = (x[batch_nodes] @ self.w_threshold[g]).view(-1)
+        thresholds = F.relu(x[batch_nodes] @ self.w_threshold[g]).view(-1)
+        # print(thresholds)
 
         # 初始化batch图 边、节点、权重; 初始化边、节点对应batch_node
-        e_id, n_id, n_p = [], [batch_nodes], [torch.ones(batch_size)]
-        e_batch, n_batch = [], [torch.arange(batch_size)]
+        e_id, n_id, n_p = [torch.Tensor([]).to(int)], [batch_nodes], [torch.ones(batch_size)]
+        e_batch, n_batch = [torch.Tensor([]).to(int)], [torch.arange(batch_size)]
 
         # 开始迭代
         budgets = torch.full((batch_size,), self.node_budget)
@@ -147,37 +152,61 @@ class AdaptiveSampler(nn.Module):
                 ptrs.append(torch.full((len(idx),), bn))
                 inc.append(inc[-1] + len(idx))
                 num_nodes_list[bn] = len(idx)
+            pre = batch_ptr
             u_idx, edge_inv, batch_ptr = torch.cat(idxs), torch.cat(invs), torch.cat(ptrs)
 
             """计算p_u"""
-            # alpha = 0.01
-            # coe = pow(1-alpha, hop-1)  # pagerank
+            # alpha = 0.1
+            # coe = pow(1-alpha, hop[pre]-1)  # pagerankch
             # coe = self.max_hop - hop / self.max_hop  # markvo
             # coe = budget / self.node_budget  # adapt
+
+            # ego_score = self.batch_kernel(h_roots[batch_ptr], x[u[u_idx]], g)
+            # layer_score = self.layer_kernel(x[v], x[u], adj, g, hop[pre])[u_idx]
+
             ego_score = self.cos(h_roots[batch_ptr], x[u[u_idx]] * self.w_ego_u[g])
-            layer_score = self.layer_kernel(x[v], x[u], adj, g)[u_idx]
-            p_u = (self.a * ego_score + (1 - self.a) * layer_score) * self.n_imp[u[u_idx]] \
-                  * (budgets[batch_ptr] / self.node_budget)
-            # print('\nHop:', hop)
-            # print(f'Ego: {ego_score.mean():.4f}, Layer: {layer_score.mean():.4f}, Pre P: {p_u.mean():.4f}', end=', ')
+
+            h_v = x[v] @ self.w_layer_v[g] / hop[pre]
+            h_u = x[u] @ self.w_layer_u[g]
+            layer_score = (h_u + matmul(adj, h_v, reduce='sum')).view(-1)[u_idx]
+            # layer_score = F.normalize(p, dim=0).view(-1)[u_idx]
+
+            p_u = ego_score + layer_score  # / num_nodes_list[batch_ptr]
+
+            # p_u = (self.a * ego_score + (1 - self.a) * layer_score) \
+            # * self.n_imp[u[u_idx]] * (budgets[batch_ptr] / self.node_budget)
+
             if max(hop) == 1:
                 batch_node_pos = [inc[i] + (u_idx[inc[i]:inc[i + 1]] == i).nonzero().item() for i in remain_batch]
                 p_norm = p_u[batch_node_pos].clone().detach()
 
-            p_u = p_u / p_norm[batch_ptr] + 1.0
-            p_u = replace_nan(p_u, nan_to=0., inf_to=1.)
-            # print(f'Mid mid P:{p_u.mean():.4f}', end=', ')
-            # pre_budgets = budgets.clone()
+            p_u = (p_u * self.n_imp[u[u_idx]]) + 1
+            # print(f'Hop: {max(hop)}, Ego: {ego_score.mean():.4f}, Layer: {layer_score.mean():.4f}, P: {p_u.mean():.4f}')
 
+            p_u = replace_nan(p_u, nan_to=0., inf_to=1.)  # 目前没有用，防止报错
+
+            # pre_budgets = budgets.clone()
             """计算mask"""
             p_clip = torch.clamp(p_u, min=1e-5, max=1)
+            new_p_u = torch.empty_like(p_u)
             mask = torch.zeros((u_idx.size(0),), dtype=torch.bool)
             terminate_idx = []  # 开销用完，不会参与下一阶段计算
             for i, bn in enumerate(remain_batch):
                 start, end = inc[i], inc[i + 1]
-                batch_p = p_clip[start:end]
-                num_sample = sum(batch_p).item()
+                # batch_p = p_clip[start:end]
+                # num_sample = sum(batch_p).item()
 
+                # batch_p = p_u[start:end] / max(p_u[start:end])
+
+                batch_p = (h_roots[batch_ptr][start:end].sum(dim=-1) + layer_score[start:end]) * self.n_imp[u[u_idx][start:end]]
+
+                # print(batch_p)
+                num_sample = (torch.abs(batch_p) > 0).sum().item()
+                # print(hop[bn].item(), end-start, num_sample)
+                # num_sample = torch.clamp(new_p_u[start:end] / 2, 1e-5, 1).sum().item()
+                # print(torch.log(batch_p/batch_p.sum()))
+
+                # print(batch_p)
                 # 默认保底采样
                 # num_sample = clip_int(num_sample, 1, budgets[bn])
 
@@ -185,29 +214,24 @@ class AdaptiveSampler(nn.Module):
                 if num_sample < 1:
                     hop[bn] -= 1
                     continue
-                num_sample = min(round(num_sample), budgets[bn])
-
-                mask[start:end][torch.multinomial(batch_p, num_sample)] = 1
+                num_sample = min(end-start, budgets[bn])
+                mask[start:end][torch.multinomial(torch.abs(batch_p), num_sample)] = 1
                 budgets[bn] -= num_sample
+
+                batch_p -= thresholds[bn]
+                new_p_u[start: end] = batch_p + 1
 
                 # 如果开销耗尽, 则下一层v中不包含该batch（这一层还是包含的）
                 if budgets[bn] <= 0 or hop[bn] >= self.max_hop:
                     terminate_idx.append(torch.arange(start, end))
 
-            # print(f'Post P:{p_u.mean():.4f}')
+            p_u = new_p_u
             # print(f'Full: {num_nodes_list.tolist()} \nSamp: {(pre_budgets-budgets).tolist()}')
-            # print(f'P Norm: {p_norm.tolist()}')
+            # print('P Norm: ', ["%.4f" % pn for pn in p_norm.tolist()])
 
             """不受budget、hop控制的threshold"""
-            old_mask = mask
             # p_u -= threshold  # 为了让threshold可导, 自适应 threshold
             mask = mask & (p_u > 0)  # Todo: 0 threshold
-            if sum(mask).item() < 1:  # TODO: 不够优雅
-                if not e_id:
-                    mask = old_mask
-                    budgets = [-1]
-                else:
-                    break
 
             """保存当前层采样节点"""
             e_id.append(layer_e[mask[edge_inv]])
@@ -220,6 +244,10 @@ class AdaptiveSampler(nn.Module):
             if len(terminate_idx) > 0:
                 mask = mask.clone()  # 为了不影响反向传播
                 mask[torch.cat(terminate_idx)] = 0
+            if sum(mask).item() < self.min_nodes:  # 提前终止
+                break
+
+            # print(len(mask), sum(mask))
             v, batch_ptr = u[u_idx][mask], batch_ptr[mask]
 
         e_id, n_id, n_p = torch.cat(e_id), torch.cat(n_id), torch.cat(n_p)
@@ -344,13 +372,20 @@ class AdaptiveSampler(nn.Module):
 
         return self.cos(h_root, h_u)
 
-    def layer_kernel(self, h_v, h_u, adj, g):
-        h_v = h_v @ self.w_layer_v[g]
-        h_u = h_u @ self.w_layer_u[g]
-        h_msg = matmul(adj, h_v, reduce='sum')
-        # h_msg = adj @ h_v
+    def batch_kernel(self, h_root, h_u, g):
+        h_u = h_u * self.w_ego_u[g]
+        # msg = F.normalize(h_root, dim=0).view(-1) * F.normalize(h_u, dim=0).view(-1)
+        # print(msg.shape)
+        # h_msg = h_root * h_u
 
-        return F.normalize(F.relu(h_msg + h_u), dim=0).view(-1)
+        return self.cos(h_root, h_u)
+
+    def layer_kernel(self, h_v, h_u, adj, g, hop):
+        h_v = h_v @ self.w_layer_v[g] / hop
+        h_u = h_u @ self.w_layer_u[g]
+        p = F.relu(h_u + matmul(adj, h_v, reduce='sum'))
+        return F.normalize(p, dim=0).view(-1)
+        # return p.view(-1)
 
     def heuristic_importance(self):
         """这里是全局重要性， 并不只是针对被采样节点的重要性（参考LADIES）"""

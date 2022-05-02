@@ -2,6 +2,7 @@ import copy
 
 import torch
 import torch_geometric.transforms as T
+import numpy as np
 from torch_geometric.loader import ClusterData
 from tqdm import tqdm
 from torchmetrics import F1Score, Accuracy
@@ -77,9 +78,10 @@ def main(hparams):
 
     data, num_features, num_classes, processed_dir = get_data(name=hparams.dataset, split=hparams.split)
     mask = data.train_mask.sum()
-    kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 0, 'persistent_workers': False}
+    kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 10, 'persistent_workers': True}
     if hparams.loader == 'sage':
-        train_loader = NeighborLoader(data, input_nodes=data.train_mask, num_neighbors=[10, 10], **kwargs)
+        kwargs.update({'num_neighbors': [10] * 2})
+        train_loader = NeighborLoader(data, input_nodes=data.train_mask, **kwargs)
     elif hparams.loader == 'cluster':
         cluster_data = ClusterData(data, num_parts=1500, save_dir=processed_dir)
         train_loader = ClusterLoader(cluster_data, **kwargs)
@@ -126,7 +128,7 @@ if __name__ == '__main__':
         'dataset': 'cora',
         'split': 'full',
         'loader': 'sage',
-        'batch_size': 10,
+        'batch_size': 70,
         # model
         'hidden_dim': 128,
         'init_layers': 0,
@@ -136,7 +138,7 @@ if __name__ == '__main__':
         'jk': 'last',
         'residual': None,
         # training
-        'seed': 123,
+        'seed': -1,
         'lr': 0.01,
         'weight_decay': 0,
         'grad_norm': None,

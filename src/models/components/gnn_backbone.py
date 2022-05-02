@@ -92,7 +92,7 @@ class GenGNN(torch.nn.Module):
         out_channels: Optional[int] = None,
         init_layers: int = 1,  # 初始化MLP的层数
         dropout: float = 0.0,
-        dropedge = 0,
+        dropedge: int = 0,
         act: Union[str, Callable, None] = "relu",
         norm: Optional[torch.nn.Module] = None,
 
