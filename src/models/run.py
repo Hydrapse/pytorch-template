@@ -1,6 +1,11 @@
 import copy
 import sys
 import time
+from typing import Union
+
+from torch import Tensor
+from torch_geometric.typing import OptPairTensor, Adj, Size
+from torch_sparse import SparseTensor, matmul
 
 sys.path.append('/home/xhh/notebooks/GNN/pytorch-template')
 sys.path.append('/Users/synapse/Desktop/Repository/pycharm-workspace/pytorch-template')
@@ -23,8 +28,25 @@ from src.utils.index import setup_seed
 import numpy as np
 
 
-# class Conv(SAGEConv):
+class Conv(SAGEConv):
+    def forward(self, x, adj, p=None, size=None) -> Tensor:
+        """"""
+        if isinstance(x, Tensor):
+            x_l = x if p is None else x * p
+            x: OptPairTensor = (x_l, x)
 
+        # propagate_type: (x: OptPairTensor)
+        out = self.propagate(adj, x=x, size=size)
+        out = self.lin_l(out)
+
+        x_r = x[1]
+        if self.root_weight and x_r is not None:
+            out += self.lin_r(x_r)
+
+        if self.normalize:
+            out = F.normalize(out, p=2., dim=-1)
+
+        return out
 
 
 class GNN(torch.nn.Module):
@@ -41,17 +63,17 @@ class GNN(torch.nn.Module):
     def forward(self, x, adj_t, p, batch, root_ptr):
         p = p.reshape(-1, 1)
 
-        # x = x * p
         # x = torch.cat((x, p.view(-1, 1)), dim=-1)
-
         for i, conv in enumerate(self.convs):
             # c = torch.zeros_like(x)
             # c[root_ptr] = global_mean_pool(x * p, batch)
             # x = x + c
             x = conv(x, adj_t)
-            if i < len(self.convs):
-                x = x.relu_()
-                x = F.dropout(x, p=0.3, training=self.training)
+            x = x.relu_()
+            x = F.dropout(x, p=0.3, training=self.training)
+            if i < len(self.convs) - 1:
+                x = x * p
+            #     x = torch.cat([x, x * p], dim=-1)
 
         x = torch.cat([x[root_ptr], global_mean_pool(x * p, batch)], dim=-1)
         x = self.lin(x)
@@ -59,7 +81,7 @@ class GNN(torch.nn.Module):
         return x
 
 
-def train(epoch, loader, model, optimizer, device, sampler):
+def train(epoch, loader, model, optimizer, device):
     model.train()
 
     pbar = tqdm(total=int(len(loader.dataset)))
@@ -97,7 +119,7 @@ def train(epoch, loader, model, optimizer, device, sampler):
     train_loss = total_loss / total_examples
     train_acc = total_correct / total_examples
 
-    print(f'Epoch: {epoch:02d}, Avg Nodes {sum(nodes)/len(nodes):.0f}, '
+    print(f'Epoch: {epoch:02d}, Avg Nodes {sum(nodes) / len(nodes):.0f}, '
           f'Mean Hop: {sum(hops) / len(hops):.2f}')
 
     return train_loss, train_acc
@@ -140,7 +162,7 @@ def main():
               'undirected': False
               }
 
-    sampler = AdaptiveSampler(data, 50, max_hop=10,  alpha=1e-2, min_nodes=70,
+    sampler = AdaptiveSampler(data, 30, max_hop=10, alpha=0.01, min_nodes=kwargs['batch_size'],
                               p_gather='mean', num_groups=1, group_type='full', ego_mode=False)
 
     train_loader = EgoGraphLoader(data.train_mask, sampler, **kwargs)
@@ -163,13 +185,13 @@ def main():
 
         print(f'------------------------{i}------------------------')
         best_val_acc = best_test_acc = 0
-        for epoch in range(1, epochs+1):
+        for epoch in range(1, epochs + 1):
             # sampler.min_nodes = 70
             # sampler.max_hop = 3
-            train_loss, train_acc = train(epoch, train_loader, model, optimizer, device, sampler)
+            train_loss, train_acc = train(epoch, train_loader, model, optimizer, device)
             # sampler.max_hop = 10
             # sampler.min_nodes = 0
-            if epoch % 1 == 0 and epoch > 2:
+            if epoch % 1 == 0 and epoch > 5:
                 start_time = time.perf_counter()
                 val_acc, val_hop = test(val_loader, model, device)
                 tmp_test_acc, test_hop = test(test_loader, model, device)

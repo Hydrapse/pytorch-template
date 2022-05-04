@@ -41,7 +41,7 @@ def main(hparams):
     # metric = torchmetrics.F1Score(average='micro')
     metric = torchmetrics.Accuracy()
 
-    data, num_features, num_classes, _  = get_data('cora', split='public')
+    data, num_features, num_classes, _  = get_data('cora', split='full')
     to_sparse(data)
 
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
@@ -74,12 +74,12 @@ if __name__ == '__main__':
         'conv_layers': 2,
         'dropout': 0.3,
         'dropedge': 0.,
-        'jk': None,
+        'jk': 'last',
         'residual': None,
         'lr': 0.01,
         'weight_decay': 0,
         'grad_norm': None,
-        'epoch': 200,
+        'epoch': 100,
         'seed': 123,
     })
 

@@ -101,7 +101,7 @@ class AdaptiveSampler(nn.Module):
             # for w in [self.w_layer_u[g], self.w_layer_v[g]]:
             #     w.reset_parameters()
 
-            init.zeros_(self.bias[g])
+            init.ones_(self.bias[g])
             for w in [self.w_threshold[g], self.bias[g]]:
                 init.uniform_(w.data, -bound, bound)
                 # torch.nn.init.uniform_(w, 0, 1e-6)
@@ -167,19 +167,17 @@ class AdaptiveSampler(nn.Module):
             # ego_score = self.batch_kernel(h_roots[batch_ptr], x[u[u_idx]], g)
             # layer_score = self.layer_kernel(x[v], x[u], adj, g, hop[pre])[u_idx]
 
-            h_v = x[v] * self.w_layer_v[g].view(-1) / hop[pre].view(-1, 1)
+            h_v = x[v] * self.w_layer_v[g].view(-1)
             h_u = x[u] * self.w_ego_u[g] + matmul(adj, h_v, reduce='sum')
-            ego_score = self.cos(h_roots[batch_ptr], h_u[u_idx])  # * self.n_imp[u[u_idx]]
+            p_u = self.cos(h_roots[batch_ptr], h_u[u_idx] / num_nodes_list[batch_ptr].view(-1, 1))
+            p_u *= self.alpha
 
             # ego_score = F.relu(h_roots[batch_ptr] + h_msg).sum(dim=-1)  # * self.n_imp[u[u_idx]]
             # ego_score = self.cos(h_roots[batch_ptr], x[u[u_idx]] * self.w_ego_u[g])
 
             # layer_score = h_u + matmul(adj, h_v, reduce='sum')
             # layer_score = F.normalize(layer_score, dim=0).view(-1)[u_idx]
-
-            p_u = ego_score * self.alpha + (1 - self.alpha)  # + 0.5  # + layer_score  # / num_nodes_list[batch_ptr]
             # print(p_u.mean(), p_u.std())
-            # print(p_u)
 
             # p_u = (self.a * ego_score + (1 - self.a) * layer_score) \
             # * self.n_imp[u[u_idx]] * (budgets[batch_ptr] / self.node_budget)
@@ -193,7 +191,7 @@ class AdaptiveSampler(nn.Module):
 
             # pre_budgets = budgets.clone()
             """计算mask"""
-            p_clip = torch.abs(p_u)
+            p_clip = torch.abs(p_u - self.alpha + 1)
             mask = torch.zeros((u_idx.size(0),), dtype=torch.bool)
             terminate_idx = []  # 开销用完，不会参与下一阶段计算
             for i, bn in enumerate(remain_batch):
@@ -216,12 +214,13 @@ class AdaptiveSampler(nn.Module):
 
             """不受budget、hop控制的threshold"""
             # p_u -= threshold  # 为了让threshold可导, 自适应 threshold
-            # mask = mask & (p_u > 0)  # Todo: 0 threshold
+            # mask = mask & (p_u > 0)
+            p_u = p_u[mask] / hop[batch_ptr][mask] - self.alpha + 1
 
             """保存当前层采样节点"""
             e_id.append(layer_e[mask[edge_inv]])
             n_id.append(u[u_idx][mask])
-            n_p.append(p_u[mask])
+            n_p.append(p_u)
             e_batch.append(batch_ptr[edge_inv][mask[edge_inv]])
             n_batch.append(batch_ptr[mask])
 

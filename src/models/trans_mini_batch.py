@@ -80,7 +80,7 @@ def main(hparams):
     mask = data.train_mask.sum()
     kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 10, 'persistent_workers': True}
     if hparams.loader == 'sage':
-        kwargs.update({'num_neighbors': [10] * 2})
+        kwargs.update({'num_neighbors': [5] * 2})
         train_loader = NeighborLoader(data, input_nodes=data.train_mask, **kwargs)
     elif hparams.loader == 'cluster':
         cluster_data = ClusterData(data, num_parts=1500, save_dir=processed_dir)
@@ -125,10 +125,10 @@ if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
         # data
-        'dataset': 'cora',
+        'dataset': 'citeseer',
         'split': 'full',
         'loader': 'sage',
-        'batch_size': 70,
+        'batch_size': 256,
         # model
         'hidden_dim': 128,
         'init_layers': 0,
@@ -138,7 +138,7 @@ if __name__ == '__main__':
         'jk': 'last',
         'residual': None,
         # training
-        'seed': -1,
+        'seed': 123,
         'lr': 0.01,
         'weight_decay': 0,
         'grad_norm': None,
