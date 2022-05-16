@@ -7,7 +7,7 @@ from torch_geometric.datasets import Reddit
 from torch_geometric.loader import ClusterData, ClusterLoader, NeighborSampler
 from torch_geometric.nn import SAGEConv
 
-from src.datamodules.datasets.data import get_data
+from src.datamodules.components.data import get_data
 
 data, num_features, num_classes, processed_dir = get_data('reddit')
 

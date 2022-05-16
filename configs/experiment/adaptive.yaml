@@ -6,8 +6,8 @@
 defaults:
   - override /mode: exp.yaml
   - override /trainer: default.yaml
-  - override /model: mnist.yaml
-  - override /datamodule: mnist.yaml
+  - override /model: gnn.yaml
+  - override /datamodule: adaptive.yaml
   - override /callbacks: default.yaml
   - override /logger:
     - neptune.yaml
@@ -18,27 +18,52 @@ defaults:
 
 # name of the run determines folder name in logs
 # can also be accessed by loggers
-name: "example"
+name: "adaptive-sampler-1"
 
-seed: 12345
+seed: 123
 
 trainer:
-  min_epochs: 1
-  max_epochs: 10
-  gradient_clip_val: 0.5
-  gpus: 3
-  strategy: ddp
-
-model:
-  lin1_size: 32
-  lin2_size: 32
-  lin3_size: 64
-  lr: 0.001
+  min_epochs: 0
+  max_epochs: 20
+#  gradient_clip_val: 0.5
+  gpus: 0
+#  strategy: ddp
 
 datamodule:
-  batch_size: 64
-  train_val_test_split: [55_000, 5_000, 10_000]
-  num_workers: 12
+#  num_workers: 0
+#  persistent_workers: False
+
+  # dataset
+  dataset: cora
+  batch_size: 70
+  undirected: False
+  # training
+  lr: 0.01
+  weight_decay: 1e-4
+  # adapt
+  node_budget: 30
+  alpha: 0.1
+  max_hop: 10
+  min_nodes: 70
+  num_groups: 1
+  group_type: full
+  ego_mode: False
+  to_single_layer: False
+
+model:
+  model: sage
+  lr: 0.001
+  # adapt
+  subg_pool: []
+  pool_type: mean
+  # base
+  hidden_channels: 128
+  conv_layers: 2
+  dropedge: 0
+  residual: null
+  jk: null
+
+
 
 # 覆盖掉logger配置
 #logger:

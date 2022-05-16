@@ -1,84 +1,134 @@
-import copy
 import sys
 import time
-from typing import Union
 
-from torch import Tensor
-from torch_geometric.typing import OptPairTensor, Adj, Size
-from torch_sparse import SparseTensor, matmul
+from pytorch_lightning import seed_everything
 
 sys.path.append('/home/xhh/notebooks/GNN/pytorch-template')
 sys.path.append('/Users/synapse/Desktop/Repository/pycharm-workspace/pytorch-template')
 
-from src.models.components.assort_sampler import AdaptiveSampler
-from torch_geometric.nn import SAGEConv, global_mean_pool, GCNConv, GATConv
-from torch_geometric.utils import add_remaining_self_loops
+from torch import Tensor, nn
+from torch_geometric.typing import OptPairTensor
+from torch_scatter import scatter
+from torch_sparse import SparseTensor, matmul
 
-from torch.utils.data import DataLoader
+from src.models.components.backbone import GraphSAGE, GCN
+
+from src.datamodules.components.sampler import AdaptiveSampler
+from torch_geometric.nn import SAGEConv, global_mean_pool
+
 from tqdm import tqdm
 
 import torch.nn.functional as F
 import torch
-import torch_geometric.transforms as T
 
 # from src.models.components.gnn_backbone import GCN
-from src.datamodules.datasets.data import get_data
-from src.datamodules.datasets.loader import EgoGraphLoader
+from src.datamodules.components.data import get_data
+from src.datamodules.components.loader import EgoGraphLoader
 from src.utils.index import setup_seed
 import numpy as np
 
 
 class Conv(SAGEConv):
-    def forward(self, x, adj, p=None, size=None) -> Tensor:
+    def __init__(self, in_channels, out_channels, groups, batch_size, **kwargs):
+        super().__init__(in_channels, out_channels, **kwargs)
+
+        self.batch_size = batch_size
+        self.group_lin = nn.Linear(in_channels, groups, bias=False)
+
+    def forward(self, x, adj, **kwargs) -> Tensor:
         """"""
         if isinstance(x, Tensor):
-            x_l = x if p is None else x * p
-            x: OptPairTensor = (x_l, x)
+            x: OptPairTensor = (x, x)
 
-        # propagate_type: (x: OptPairTensor)
-        out = self.propagate(adj, x=x, size=size)
+        out = self.propagate(adj, x=x[0], **kwargs)
         out = self.lin_l(out)
 
         x_r = x[1]
         if self.root_weight and x_r is not None:
             out += self.lin_r(x_r)
 
-        if self.normalize:
-            out = F.normalize(out, p=2., dim=-1)
+        return out
+
+    def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor,
+                              p=None, batch=None, group_ptr=None) -> Tensor:
+
+        s = self.group_lin(x).softmax(dim=-1).t()  # G * N
+        expand_x = s.unsqueeze(-1) * x.unsqueeze(0)  # G * N * F
+        # 与 adj 对齐: (G * batch_nodes * batch_size) * F
+        expand_x = torch.cat([expand_x[:, batch == i, :].view(-1, self.in_channels)
+                              for i in range(self.batch_size)])
+        if p is not None:
+            expand_x *= p.view(-1, 1)
+
+        adj_t = adj_t.set_value(None, layout=None)
+        expand_x = matmul(adj_t, expand_x, reduce=self.aggr)
+
+        return scatter(expand_x, group_ptr, dim=0, reduce='sum')
+
+
+class Conv2(SAGEConv):
+    def __init__(self, in_channels, out_channels, num_groups, **kwargs):
+        super().__init__(in_channels, out_channels, **kwargs)
+
+        self.num_groups = num_groups
+        self.group_lin = nn.Linear(in_channels, num_groups, bias=False)
+
+    def forward(self, x, adj, p=None, batch=None, group_ptr=None) -> Tensor:
+        if self.num_groups == 1:
+            if p is not None: x *= p.view(-1, 1)
+            return super().forward(x, adj)
+
+        s = self.group_lin(x).softmax(dim=-1).t()  # G * N
+        expand_x = s.unsqueeze(-1) * x.unsqueeze(0)  # G * N * F
+
+        # 与 adj 对齐: (G * batch_nodes * batch_size) * F
+        batch_size = int(batch.unique().numel() / self.num_groups)
+        expand_x = torch.cat([expand_x[:, batch == i, :].view(-1, self.in_channels)
+                              for i in range(batch_size)])
+        if p is not None:
+            expand_x *= p.view(-1, 1)
+
+        out = super().forward(expand_x, adj)
+        out = scatter(out, group_ptr, dim=0, reduce='sum')
 
         return out
 
 
 class GNN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_groups, as_single_layer: bool):
         super().__init__()
 
+        # 把GNN看做单层时只在最后阶段区分不同的组，否则只在conv阶段区分组
+        self.edge_groups = 1 if as_single_layer else num_groups
+        self.node_groups = 1 if not as_single_layer else num_groups
+
         self.convs = torch.nn.ModuleList()
-        self.convs.append(SAGEConv(in_channels, hidden_channels))
-        self.convs.append(SAGEConv(hidden_channels, hidden_channels))
+        self.convs.append(Conv2(in_channels, hidden_channels, self.edge_groups))
+        self.convs.append(Conv2(hidden_channels, hidden_channels, self.edge_groups))
         # self.convs.append(SAGEConv(hidden_channels, hidden_channels))
 
-        self.lin = torch.nn.Linear(2 * hidden_channels, out_channels)
+        self.lin = nn.Linear(2 * self.node_groups * hidden_channels, out_channels)
 
-    def forward(self, x, adj_t, p, batch, root_ptr):
-        p = p.reshape(-1, 1)
-
+    def forward(self, x, adj_t, root_ptr, p, batch, group_ptr):
         # x = torch.cat((x, p.view(-1, 1)), dim=-1)
         for i, conv in enumerate(self.convs):
             # c = torch.zeros_like(x)
             # c[root_ptr] = global_mean_pool(x * p, batch)
             # x = x + c
-            x = conv(x, adj_t)
+            x = conv(x, adj_t, p=None if i == 0 else p, batch=batch, group_ptr=group_ptr)
             x = x.relu_()
             x = F.dropout(x, p=0.3, training=self.training)
-            if i < len(self.convs) - 1:
-                x = x * p
-            #     x = torch.cat([x, x * p], dim=-1)
 
-        x = torch.cat([x[root_ptr], global_mean_pool(x * p, batch)], dim=-1)
-        x = self.lin(x)
+        if self.edge_groups > 1:
+            p = scatter(p, group_ptr, reduce='sum')
 
-        return x
+        x = torch.cat([x[root_ptr], global_mean_pool(x * p.view(-1, 1), batch)], dim=-1)
+
+        if self.node_groups > 1:
+            x = x.view(self.node_groups, -1, x.size(-1))  # G * batch_size * F
+            x = torch.cat([x[i] for i in range(x.size(0))], dim=-1)  # batch_size * (F * G)
+
+        return self.lin(x)
 
 
 def train(epoch, loader, model, optimizer, device):
@@ -89,29 +139,21 @@ def train(epoch, loader, model, optimizer, device):
 
     total_loss = total_examples = total_correct = 0
     nodes, hops = [], []
-    optimizer.zero_grad()
     for i, batch in enumerate(loader):
         batch = batch.to(device)
         nodes.append(batch.num_nodes)
         hops.append(batch.hop.to(torch.float).mean())
 
-        out = model(batch.x, batch.adj_t, batch.p, batch.batch, batch.ego_ptr)
+        out = model(batch.x, batch.adj_t, batch.ego_ptr,
+                    p=batch.p, batch=batch.batch, group_ptr=batch.group_ptr)
         loss = F.cross_entropy(out, batch.y)
-        loss.backward()
-        # temp_w = copy.copy(sampler.w_ego_root[0])
-        # temp_m = copy.copy(model.lin.weight)
-        # print(model.lin.weight)
-        # print(sampler.w_ego_root[0])
-
-        # print(f'layer: {sampler.w_layer_u.grad}, ego: {sampler.w_ego_u}')
-        optimizer.step()
-        # print(torch.equal(temp_w, sampler.w_ego_root[0]))
-        # print(torch.equal(temp_m, model.lin.weight))
-
-        total_loss += float(loss) * batch.num_graphs
-        total_correct += int((out.argmax(dim=-1) == batch.y).sum())
-        total_examples += batch.num_graphs
         optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += float(loss) * batch.batch_size
+        total_correct += int((out.argmax(dim=-1) == batch.y).sum())
+        total_examples += batch.batch_size
 
         pbar.update(batch.batch_size)
     pbar.close()
@@ -135,35 +177,41 @@ def test(loader, model, device):
         nodes.append(batch.num_nodes)
         hops.append(batch.hop.to(torch.float).mean())
 
-        out = model(batch.x, batch.adj_t, batch.p, batch.batch, batch.ego_ptr)
+        out = model(batch.x, batch.adj_t, batch.ego_ptr,
+                    p=batch.p, batch=batch.batch, group_ptr=batch.group_ptr)
 
         correct = int((out.argmax(dim=-1) == batch.y).sum())
         total_correct += correct
-        total_examples += batch.num_graphs
-        # print(i, correct / batch.num_graphs)
+        total_examples += batch.batch_size
 
     return total_correct / total_examples, hops
 
 
 def main():
     runs, epochs, seed = 5, 20, 123
-    setup_seed(seed)
+    # setup_seed(seed)
+    seed_everything(seed, workers=True)
 
     torch.autograd.set_detect_anomaly(False)
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
 
-    data, num_features, num_classes, processed_dir = get_data('cora', split='full')
+    data, num_features, num_classes, processed_dir = get_data('flickr', split='full')
 
-    kwargs = {'batch_size': 70,
+    kwargs = {'batch_size': 128,
               # 'num_workers': 0,
               # 'persistent_workers': False,
-              'pin_memory': False,
+              'pin_memory': True,
               'shuffle': True,
-              'undirected': False
+              'undirected': False  # 在pubmed效果好
               }
+    batch_size = kwargs['batch_size']
+    num_groups = 1
+    single_layer = False
 
-    sampler = AdaptiveSampler(data, 30, max_hop=10, alpha=0.01, min_nodes=kwargs['batch_size'],
-                              p_gather='mean', num_groups=1, group_type='full', ego_mode=False)
+    sampler = AdaptiveSampler(data, 100, max_hop=10, alpha=0.3, min_nodes=batch_size,
+                              p_gather='sum', num_groups=num_groups, group_type='full',
+                              ego_mode=False, to_single_layer=single_layer)
+    num_features = sampler.feature_size
 
     train_loader = EgoGraphLoader(data.train_mask, sampler, **kwargs)
     val_loader = EgoGraphLoader(data.val_mask, sampler, num_workers=0, persistent_workers=False, **kwargs)
@@ -176,11 +224,14 @@ def main():
     best_val, best_test = [], []
     for i in range(1, runs + 1):
         sampler.reset_parameters()
-        model = GNN(num_features, 128, num_classes).to(device)
+        model = GraphSAGE(num_features, 128, 3, num_classes, subg_pool=[-1], init_layers=0, dropout=0.4,
+                          num_groups=num_groups, as_single_layer=single_layer, pool_type='mean').to(device)
+        # model = GNN(num_features, 128, num_classes, num_groups, single_layer).to(device)
+        model.reset_parameters()
         # params = list(sampler.parameters()) + list(model.parameters())
         # optimizer = torch.optim.Adam(params, lr=0.001, weight_decay=0)
         optimizer = torch.optim.Adam(
-            [{'params': sampler.parameters(), 'lr': 0.01, 'weight_decay': 1e-4},
+            [{'params': sampler.parameters(), 'lr': 0.001, 'weight_decay': 0},
              {'params': model.parameters(), 'lr': 0.001}])
 
         print(f'------------------------{i}------------------------')
@@ -191,7 +242,7 @@ def main():
             train_loss, train_acc = train(epoch, train_loader, model, optimizer, device)
             # sampler.max_hop = 10
             # sampler.min_nodes = 0
-            if epoch % 1 == 0 and epoch > 5:
+            if epoch % 1 == 0 and epoch > 0:
                 start_time = time.perf_counter()
                 val_acc, val_hop = test(val_loader, model, device)
                 tmp_test_acc, test_hop = test(test_loader, model, device)
@@ -212,4 +263,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    # print(sampler([26354]))

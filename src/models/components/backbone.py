@@ -20,6 +20,7 @@ from torch_geometric.typing import Adj
 import torch
 from torch_geometric.utils import dropout_adj
 
+from src.models.components.layer import MultGroupConv, EgoGraphPooling
 from src.utils.index import dropout_edge
 
 
@@ -84,22 +85,26 @@ class GenGNN(torch.nn.Module):
         **kwargs (optional): Additional arguments of the underlying
             :class:`torch_geometric.nn.conv.MessagePassing` layers.
     """
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_channels: int,
-        conv_layers: int,
-        out_channels: Optional[int] = None,
-        init_layers: int = 1,  # 初始化MLP的层数
-        dropout: float = 0.0,
-        dropedge: int = 0,
-        act: Union[str, Callable, None] = "relu",
-        norm: Optional[torch.nn.Module] = None,
 
-        residual: Optional[str] = None,
-        jk: Optional[str] = None,
-        act_first: bool = False,
-        **kwargs,
+    def __init__(
+            self,
+            in_channels: int,
+            hidden_channels: int,
+            conv_layers: int,
+            out_channels: Optional[int] = None,
+            num_groups: int = 1,
+            as_single_layer: bool = False,
+            subg_pool: List[int] = None,  # 判断是否为AS的重要依据
+            pool_type: str = 'mean',
+            init_layers: int = 1,  # 初始化MLP的层数
+            dropout: float = 0.0,
+            dropedge: int = 0,
+            act: Union[str, Callable, None] = "relu",
+            norm: Optional[torch.nn.Module] = None,
+            residual: Optional[str] = None,
+            jk: Optional[str] = None,
+            act_first: bool = False,
+            **kwargs,
     ):
         super().__init__()
 
@@ -108,6 +113,14 @@ class GenGNN(torch.nn.Module):
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
         self.num_layers = conv_layers
+
+        self.subg_pool = subg_pool
+        if as_single_layer:  # 只在最后阶段区分不同的组
+            self.edge_groups = 1
+            node_groups = num_groups
+        else:  # 只在conv阶段区分组
+            self.edge_groups = num_groups
+            node_groups = 1
 
         self.dropout = dropout
         self.dropedge = dropedge
@@ -133,7 +146,7 @@ class GenGNN(torch.nn.Module):
         for _ in range(conv_layers - 2):
             self.convs.append(
                 self.init_conv(hidden_channels, hidden_channels, **kwargs))
-        if jk is not None:
+        if jk is not None or subg_pool:
             self.convs.append(
                 self.init_conv(hidden_channels, hidden_channels, **kwargs))
         else:
@@ -151,15 +164,21 @@ class GenGNN(torch.nn.Module):
         num_layers = conv_layers + (1 if hasattr(self, 'mlp') else 0)
         if jk is not None and jk != 'last':
             self.jk = JumpingKnowledge(jk, hidden_channels, num_layers)
-        if jk is not None:
+
+        self.pool = EgoGraphPooling(pool_type, node_groups)
+
+        if jk is not None or subg_pool:
             if jk == 'cat':
                 in_channels = num_layers * hidden_channels
             else:
                 in_channels = hidden_channels
+            if subg_pool:
+                in_channels += len(subg_pool) * hidden_channels
+                in_channels *= node_groups
             self.lin = Linear(in_channels, self.out_channels)
 
     def init_conv(self, in_channels: int, out_channels: int,
-                  **kwargs) -> MessagePassing:
+                  **kwargs) -> MultGroupConv:
         raise NotImplementedError
 
     def reset_parameters(self):
@@ -174,7 +193,7 @@ class GenGNN(torch.nn.Module):
         if hasattr(self, 'lin'):
             self.lin.reset_parameters()
 
-    def forward(self, x: Tensor, edge_index: Adj, ego_ptr = None, batch_idx = None, *args, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, edge_index: Adj, ego_ptr=None, p=None, *args, **kwargs) -> Tensor:
         xs: List[Tensor] = []
 
         x_0 = x_pre = None
@@ -186,9 +205,9 @@ class GenGNN(torch.nn.Module):
         edge_index = dropout_edge(edge_index, p=self.dropedge, training=self.training)
 
         for i in range(self.num_layers):
-            x = self.convs[i](x, edge_index, *args, **kwargs)
+            x = self.convs[i](x, edge_index, p=None if i == 0 else p, *args, **kwargs)
 
-            if i == self.num_layers - 1 and self.jk_mode is None:
+            if i == self.num_layers - 1 and self.jk_mode is None and not self.subg_pool:
                 break
             if self.act_first:
                 x = self.act(x)
@@ -207,55 +226,65 @@ class GenGNN(torch.nn.Module):
                     x = x + x_0
             else:
                 x_0 = x_pre = x
-            if hasattr(self, 'jk'):
+            if hasattr(self, 'jk') or self.subg_pool:
                 xs.append(x)
 
-        x = self.jk(xs) if hasattr(self, 'jk') else x
-        x = self.lin(x) if hasattr(self, 'lin') else x
+        if hasattr(self, 'jk'):
+            x = self.jk(xs)
 
         if ego_ptr is not None:
             x = x[ego_ptr]
-        return x
+            if self.subg_pool:  # cora no pool 效果更好
+                xs = [xs[i] for i in self.subg_pool]
+                x = self.pool(x, xs, p=p, **kwargs)
 
+        if hasattr(self, 'lin'):
+            x = self.lin(x)
+
+        return x
 
     def __repr__(self) -> str:
         return (f'{self.__class__.__name__}({self.in_channels}, '
                 f'{self.out_channels}, num_layers={self.num_layers})')
 
 
-
 class GCN(GenGNN):
 
     def init_conv(self, in_channels: int, out_channels: int,
-                  **kwargs) -> MessagePassing:
-        return GCNConv(in_channels, out_channels, **kwargs)
-
+                  **kwargs) -> MultGroupConv:
+        return MultGroupConv(
+            GCNConv(in_channels, out_channels, **kwargs),
+            self.edge_groups
+        )
 
 
 class GraphSAGE(GenGNN):
 
     def init_conv(self, in_channels: int, out_channels: int,
-                  **kwargs) -> MessagePassing:
-        return SAGEConv(in_channels, out_channels, **kwargs)
-
+                  **kwargs) -> MultGroupConv:
+        return MultGroupConv(
+            SAGEConv(in_channels, out_channels, **kwargs),
+            self.edge_groups
+        )
 
 
 class GIN(GenGNN):
 
     def init_conv(self, in_channels: int, out_channels: int,
-                  **kwargs) -> MessagePassing:
-
+                  **kwargs) -> MultGroupConv:
         from torch_geometric.nn.models.mlp import MLP
 
         mlp = MLP([in_channels, out_channels, out_channels], batch_norm=True)
-        return GINConv(mlp, **kwargs)
+        conv = GINConv(mlp, **kwargs)
+        conv.in_channels = in_channels
 
+        return MultGroupConv(conv, self.edge_groups)
 
 
 class GAT(GenGNN):
 
     def init_conv(self, in_channels: int, out_channels: int,
-                  **kwargs) -> MessagePassing:
+                  **kwargs) -> MultGroupConv:
 
         v2 = kwargs.pop('v2', False)
         heads = kwargs.pop('heads', 1)
@@ -275,13 +304,17 @@ class GAT(GenGNN):
             out_channels = out_channels // heads
 
         Conv = GATConv if not v2 else GATv2Conv
-        return Conv(in_channels, out_channels, heads=heads, concat=concat,
+        conv = Conv(in_channels, out_channels, heads=heads, concat=concat,
                     dropout=self.dropout, **kwargs)
 
+        return MultGroupConv(conv, self.edge_groups)
 
 
 class PNA(GenGNN):
 
     def init_conv(self, in_channels: int, out_channels: int,
-                  **kwargs) -> MessagePassing:
-        return PNAConv(in_channels, out_channels, **kwargs)
+                  **kwargs) -> MultGroupConv:
+        return MultGroupConv(
+            PNAConv(in_channels, out_channels, **kwargs),
+            self.edge_groups
+        )

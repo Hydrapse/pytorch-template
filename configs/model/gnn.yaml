@@ -1,0 +1,22 @@
+_target_: src.models.gnn_module.GNNModule
+
+model: sage
+metric: acc
+lr: 0.001
+weight_decay: 0.
+
+num_groups: 1
+as_single_layer: False
+subg_pool: [-1]  # 判断是否为AS的重要依据
+pool_type: mean  # max
+
+hidden_channels: 128
+conv_layers: 2
+init_layers: 0   # 初始化MLP的层数
+dropout: 0.3
+dropedge: 0
+act: relu
+act_first: False
+norm: null
+residual: null
+jk: null

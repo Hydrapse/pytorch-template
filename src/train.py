@@ -12,6 +12,8 @@ from pytorch_lightning import (
 from pytorch_lightning.loggers import LightningLoggerBase
 
 from src import utils
+from src.datamodules.adapt_datamodule import AdaptDataModule
+from src.datamodules.components.data import get_data
 
 log = utils.get_logger(__name__)
 
@@ -37,7 +39,15 @@ def train(config: DictConfig) -> Optional[float]:
 
     # Init lightning model
     log.info(f"Instantiating model <{config.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(config.model)
+    if isinstance(datamodule, AdaptDataModule):
+        config.model.num_groups = config.datamodule.num_groups
+        config.model.as_single_layer = config.datamodule.to_single_layer
+    model: LightningModule = hydra.utils.instantiate(config.model,
+                                                     in_channels=datamodule.num_features,
+                                                     out_channels=datamodule.num_classes)
+    if isinstance(datamodule, AdaptDataModule):
+        # model.sampler = datamodule.sampler
+        model.sampler_conf = datamodule.optim_conf
 
     # Init lightning callbacks
     callbacks: List[Callback] = []

@@ -3,11 +3,11 @@ import torch.nn.functional as F
 import torch
 import torch_geometric.transforms as T
 import torchmetrics
-from src.datamodules.datasets.data import get_data
+from src.datamodules.components.data import get_data
 from torch_geometric.nn.models import basic_gnn
 
-from components.gnn_backbone import GCN, GraphSAGE, GAT, GIN
-from src.datamodules.datasets.loader import to_sparse
+from components.backbone import GCN, GraphSAGE, GAT, GIN
+from src.datamodules.components.loader import to_sparse
 from src.utils.index import setup_seed, Dict
 
 

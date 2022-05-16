@@ -4,7 +4,7 @@ import torch
 import torch_geometric.transforms as T
 import torchmetrics
 
-from components.gnn_backbone import GCN, GraphSAGE, GAT, GIN
+from components.backbone import GCN, GraphSAGE, GAT, GIN
 
 
 def train(model, optimizer, data, grad_norm=None):
@@ -39,12 +39,12 @@ def main():
     # metric = torchmetrics.Accuracy()
 
     transform = T.Compose([T.ToUndirected(), T.AddSelfLoops()])
-    dataset = Flickr("/mnt/nfs-ssd/raw-datasets/pyg-format/Flickr", transform=transform)
+    dataset = Flickr("/mnt/nfs-ssd/raw-components/pyg-format/Flickr", transform=transform)
 
-    # dataset = Reddit2("/mnt/nfs-ssd/raw-datasets/pyg-format/Reddit2", transform=transform)
+    # dataset = Reddit2("/mnt/nfs-ssd/raw-components/pyg-format/Reddit2", transform=transform)
     # data.x = (data.x - data.x.mean(dim=0)) / data.x.std(dim=0)
 
-    # dataset = Planetoid("/mnt/nfs-ssd/raw-datasets/pyg-format/Planetoid", 'Cora', transform=transform)
+    # dataset = Planetoid("/mnt/nfs-ssd/raw-components/pyg-format/Planetoid", 'Cora', transform=transform)
     data = dataset[0]
 
     # hyper params

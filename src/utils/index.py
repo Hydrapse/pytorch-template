@@ -19,6 +19,10 @@ class Dict(dict):
         self[key] = value
 
 
+def mask_to_index(mask):
+    return mask.nonzero(as_tuple=False).view(-1)
+
+
 def dropout_edge(edge_index: Adj, p: float, training: bool = True):
     if not training or p == 0.:
         return edge_index
@@ -36,16 +40,6 @@ def dropout_edge(edge_index: Adj, p: float, training: bool = True):
     return edge_index
 
 
-def replace_nan(val, nan_to=0., inf_to=1.):
-    val = torch.where(torch.isinf(val), torch.full_like(val, nan_to), val)
-    return torch.where(torch.isnan(val), torch.full_like(val, inf_to), val)
-
-
-def clip_int(val, lower, upper):
-    val = 0 if math.isnan(val) else round(val)
-    return max(lower, min(val, upper))
-
-
 def setup_seed(seed):
     if seed == -1:
         return
@@ -58,7 +52,7 @@ def setup_seed(seed):
 def pred_fn(y_hat, y) -> Tuple[Tensor, Tensor]:
     if y.dim() == 1:  # multi-class
         pred = y_hat.argmax(dim=-1)
-    else:             # multi-label
+    else:  # multi-label
         pred = (y_hat > 0).float()
     return pred, y
 

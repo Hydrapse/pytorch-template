@@ -1,28 +1,31 @@
-import copy
 import math
-from collections import defaultdict
-from typing import Optional
 
 import torch
-import torch_geometric.transforms
 from torch import nn
 from torch.nn import Parameter, init
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch import Tensor
-from torch_geometric.utils import add_remaining_self_loops, to_undirected, sort_edge_index
+from torch_geometric.utils import add_remaining_self_loops, sort_edge_index
 from torch_scatter import scatter
 from torch_sparse import SparseTensor, matmul
 
 from torch_geometric.data import Batch, Data
 
-from src.utils.index import clip_int, replace_nan
+from src.utils.outliers import clip_int, replace_nan
 
 
 class EgoData(Data):
-    def __init__(self, x, edge_index, y, p=None):
-        super().__init__(x, edge_index, y=y)
+    def __init__(self, x, edge_index, p=None, num_groups=1, **kwargs):
+        super().__init__(x, edge_index, **kwargs)
         self.p = p
+        self.num_groups = num_groups
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == 'edge_index':
+            return self.num_nodes * self.num_groups
+        elif key == 'group_ptr':
+            return self.num_nodes
+        else:
+            return super().__inc__(key, value, *args, **kwargs)
 
 
 class AdaptiveSampler(nn.Module):
@@ -37,7 +40,8 @@ class AdaptiveSampler(nn.Module):
             min_nodes: int = 10,  # 最小下一层节点数
             num_groups: int = 2,
             group_type: str = 'full',  # full, split
-            ego_mode: bool = False  # 使用比较慢的ego-wise构造rootgraph
+            ego_mode: bool = False,  # 使用比较慢的ego-wise构造root graph
+            to_single_layer: bool = False  # 是否将下游模型看做单层GNN
     ):
         super().__init__()
 
@@ -52,6 +56,11 @@ class AdaptiveSampler(nn.Module):
             value=torch.arange(col.size(0)),  # .to(self.device)
             sparse_sizes=(data.num_nodes, data.num_nodes)).t()
 
+        if ego_mode and not to_single_layer:
+            raise NotImplementedError
+        if num_groups == 1:
+            group_type = 'full'
+
         self.node_budget = node_budget
         self.alpha = alpha
         self.p_gather = p_gather
@@ -60,6 +69,7 @@ class AdaptiveSampler(nn.Module):
         self.num_groups = num_groups
         self.group_type = group_type
         self.ego_mode = ego_mode
+        self.to_single_layer = to_single_layer
 
         self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         self.n_imp = self.heuristic_importance()
@@ -72,6 +82,7 @@ class AdaptiveSampler(nn.Module):
             self.x_ptr[-1] = data.num_features
             self.num_features = [group_size] * num_groups
             self.num_features[-1] += data.num_features % num_groups
+        self.feature_size = max(self.num_features) if to_single_layer else data.num_features
 
         self.w_ego_root = nn.ParameterList()
         self.w_ego_u = nn.ParameterList()
@@ -108,17 +119,85 @@ class AdaptiveSampler(nn.Module):
 
     def forward(self, batch_nodes):
         batch_nodes = torch.tensor(batch_nodes)
+        batch_size = len(batch_nodes)
 
-        batch_datas = []
+        batch_list = []
+        e_full, n_full, n_p_full = [], [], []
+        e_batch_full, n_batch_full = [], []
+        e_ptr, n_ptr = [], []
+        hop_full = torch.zeros(batch_size, dtype=torch.int)
         for g in range(self.num_groups):
             x = self.x if self.group_type == 'full' else self.x[:, self.x_ptr[g]:self.x_ptr[g+1]]
-            if self.ego_mode:
-                batch_data = self.ego_wise_sampling(batch_nodes, x, g)
-            else:
-                batch_data = self.batch_wise_sampling(batch_nodes, x, g)
-            batch_datas.append(batch_data)
 
-        return batch_datas[0]  # TODO: 为了测试方便, 只取group0
+            if self.to_single_layer:
+                if self.ego_mode:
+                    data = self.ego_wise_sampling(batch_nodes, x, g)
+                else:
+                    data = self.batch_wise_sampling(batch_nodes, x, g)
+
+                pad_size = max(self.num_features) - data.num_features
+                x = F.pad(data.x, (0, pad_size)) if pad_size > 0 else data.x
+                edge_index = data.edge_index.unique(dim=-1)
+
+                ego_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+                ego_mask[data.ego_ptr + data.ptr[:-1]] = 1
+
+                # batch_index需要随g递增， ego_mask不需要
+                batch_list.append(Data(x, edge_index, p=data.p, ego_ptr=ego_mask,
+                                       batch_index=data.batch, hop=data.hop))
+            else:
+                e_id, n_id, n_p, e_batch, n_batch, hop = self.batch_wise_sampling(batch_nodes, x, g)
+                e_full.append(e_id)
+                n_full.append(n_id)
+                n_p_full.append(n_p)
+                e_batch_full.append(e_batch)
+                n_batch_full.append(n_batch)
+                e_ptr.append(torch.full((len(e_id),), g))
+                n_ptr.append(torch.full((len(n_id),), g))
+                hop_full += hop
+
+        if self.to_single_layer:
+
+            batch_data = Batch.from_data_list(batch_list)
+            batch_data.y = self.y[batch_nodes]
+            batch_data.hop = batch_data.hop.to(float).view(-1, batch_size).mean(dim=0)
+
+            batch_data.batch = batch_data.batch_index
+            batch_data.group_ptr = batch_data.ptr
+            delattr(batch_data, 'batch_index')
+            return batch_data
+
+        e_full, n_full, n_p_full = torch.cat(e_full), torch.cat(n_full), torch.cat(n_p_full)
+        e_batch_full, n_batch_full = torch.cat(e_batch_full), torch.cat(n_batch_full)
+        e_ptr, n_ptr = torch.cat(e_ptr), torch.cat(n_ptr)
+
+        egos = []
+        for bn in range(batch_size):
+            bn_mask = n_batch_full == bn
+            be_mask = e_batch_full == bn
+
+            n_idx, local_n = n_full[bn_mask].unique(return_inverse=True)
+            num_nodes = n_idx.size(0)
+            root_ptr = local_n[0]
+
+            expand_n = local_n + n_ptr[bn_mask] * num_nodes
+            p = scatter(n_p_full[bn_mask], expand_n, reduce=self.p_gather)
+            p = F.pad(p, (0, self.num_groups * num_nodes - p.size(0)))
+
+            local_e = sort_edge_index(self.edge_index[:, e_full[be_mask]].unique(return_inverse=True)[1])
+            expand_e = local_e + e_ptr[be_mask] * num_nodes
+
+            ego_data = EgoData(self.x[n_idx], expand_e, p, self.num_groups, ego_ptr=root_ptr)
+            ego_data.group_ptr = torch.arange(num_nodes).expand(self.num_groups, -1).reshape(-1)
+            egos.append(ego_data)
+
+        batch_data = Batch.from_data_list(egos)
+        batch_data.y = self.y[batch_nodes]
+        batch_data.hop = hop_full / self.num_groups
+
+        batch_data.ego_ptr += batch_data.ptr[:-1]
+        delattr(batch_data, 'num_groups')
+        return batch_data
 
     def batch_wise_sampling(self, batch_nodes, x, g):
         batch_size = len(batch_nodes)
@@ -132,7 +211,7 @@ class AdaptiveSampler(nn.Module):
 
         # 开始迭代
         budgets = torch.full((batch_size,), self.node_budget)
-        hop, p_norm = torch.zeros(batch_size).to(int), float('-inf')
+        hop = torch.zeros(batch_size, dtype=torch.int)
         v, batch_ptr = batch_nodes, n_batch[0]
         while sum(budgets) > 0 and len(v) > 0:
             remain_batch = batch_ptr.unique().tolist()
@@ -155,12 +234,11 @@ class AdaptiveSampler(nn.Module):
                 ptrs.append(torch.full((len(idx),), bn))
                 inc.append(inc[-1] + len(idx))
                 num_nodes_list[bn] = len(idx)
-            pre = batch_ptr
             u_idx, edge_inv, batch_ptr = torch.cat(idxs), torch.cat(invs), torch.cat(ptrs)
 
             """计算p_u"""
             # alpha = 0.1
-            # coe = pow(1-alpha, hop[pre]-1)  # pagerankch
+            # coe = pow(1-alpha, hop[pre]-1)  # pagerank
             # coe = self.max_hop - hop / self.max_hop  # markvo
             # coe = budget / self.node_budget  # adapt
 
@@ -209,7 +287,6 @@ class AdaptiveSampler(nn.Module):
                 # 如果开销耗尽, 则下一层v中不包含该batch（这一层还是包含的）
                 if budgets[bn] <= 0 or hop[bn] >= self.max_hop:
                     terminate_idx.append(torch.arange(start, end))
-
             # print(f'Hop: {hop.tolist()} \nFull: {num_nodes_list.tolist()} \nSamp: {(pre_budgets-budgets).tolist()}')
 
             """不受budget、hop控制的threshold"""
@@ -236,22 +313,23 @@ class AdaptiveSampler(nn.Module):
         e_id, n_id, n_p = torch.cat(e_id), torch.cat(n_id), torch.cat(n_p)
         e_batch, n_batch = torch.cat(e_batch), torch.cat(n_batch)
 
+        if not self.to_single_layer:
+            return e_id, n_id, n_p, e_batch, n_batch, hop
+
         egos = []
         for bn in range(batch_size):
             bn_mask = n_batch == bn
             n_idx, inv_ptr = n_id[bn_mask].unique(return_inverse=True)
-            p = scatter(n_p[bn_mask], inv_ptr, dim=-1, reduce='sum')
+            p = scatter(n_p[bn_mask], inv_ptr, dim=-1, reduce=self.p_gather)
 
             """inv的unique是一个很优雅的local-e, 而且idx是排序过的unique节点id，和p的unique对应上"""
             sub_edge_index = self.edge_index[:, e_id[e_batch == bn]]
             local_e = sort_edge_index(sub_edge_index.unique(return_inverse=True)[1])
 
-            ego_data = EgoData(x[n_idx], local_e, self.y[n_idx[inv_ptr[0]]], p)
-            ego_data.ego_ptr = inv_ptr[0]
+            ego_data = EgoData(x[n_idx], local_e, p, ego_ptr=inv_ptr[0])
             egos.append(ego_data)
 
         batch_data = Batch.from_data_list(egos)
-        batch_data.ego_ptr = (batch_data.ego_ptr + batch_data.ptr[:-1])
         batch_data.hop = hop
         return batch_data
 
@@ -264,9 +342,7 @@ class AdaptiveSampler(nn.Module):
             ego_graphs.append(
                 self.sample_receptive_field(batch_nodes[i:i + 1], x, g, thresholds[i]))
 
-        batch_data = Batch.from_data_list(ego_graphs)
-        batch_data.ego_ptr = (batch_data.ego_ptr + batch_data.ptr[:-1])
-        return batch_data
+        return Batch.from_data_list(ego_graphs)
 
     def sample_receptive_field(self, batch_node, x, g, threshold):
         e_id = []  # 存储所有边index
@@ -290,7 +366,7 @@ class AdaptiveSampler(nn.Module):
             ego_score = self.ego_kernel(x[batch_node], x[u], g)
             layer_score = self.layer_kernel(x[v], x[u], adj, g)
             # TODO: 不加拓扑权重反而高一些（full）
-            p_u = (self.a * ego_score + (1 - self.a) * layer_score) * self.n_imp[u] \
+            p_u = (self.alpha * ego_score + (1 - self.alpha) * layer_score) * self.n_imp[u] \
                   * (budget / self.node_budget)
             # print('\nHop:', hop)
             # print(f'Ego: {ego_score.mean():.4f}, Layer: {layer_score.mean():.4f}, Pre P: {p_u.mean():.4f}', end=', ')
@@ -344,7 +420,7 @@ class AdaptiveSampler(nn.Module):
         p = scatter(torch.cat(n_p), n_mask, dim=-1, reduce=self.p_gather)
 
         batch_edge = self.edge_global_to_batch(n_id, e_id)
-        ego_data = EgoData(x[n_id], batch_edge, self.y[n_id[n_mask[0]]], p)  # y[batch_node]
+        ego_data = EgoData(x[n_id], batch_edge, p)
         ego_data.hop = hop
         ego_data.ego_ptr = n_mask[0]
         return ego_data
@@ -363,8 +439,8 @@ class AdaptiveSampler(nn.Module):
 
         return self.cos(h_root, h_u)
 
-    def layer_kernel(self, h_v, h_u, adj, g, hop):
-        h_v = h_v @ self.w_layer_v[g] / hop
+    def layer_kernel(self, h_v, h_u, adj, g):
+        h_v = h_v @ self.w_layer_v[g]
         h_u = h_u @ self.w_layer_u[g]
         p = F.relu(h_u + matmul(adj, h_v, reduce='sum'))
         return F.normalize(p, dim=0).view(-1)

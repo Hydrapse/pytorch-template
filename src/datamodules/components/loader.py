@@ -8,8 +8,10 @@ from torch_geometric.data import Data
 from torch_geometric.loader import ClusterLoader as ClusterL, NeighborLoader as NeighborL, \
     GraphSAINTRandomWalkSampler, ShaDowKHopSampler
 from torch_geometric.transforms import BaseTransform
+from torch_geometric.utils import to_undirected, add_self_loops
+from torch_sparse import SparseTensor
 
-from src.models.components.assort_sampler import AdaptiveSampler
+from src.datamodules.components.sampler import AdaptiveSampler
 
 
 class SetEgoPtr(BaseTransform):
@@ -25,8 +27,7 @@ class SetEgoPtr(BaseTransform):
             else:  # batch node sampling
                 data.ego_ptr = data.train_mask.nonzero(as_tuple=False).view(-1)
                 data.y = data.y[data.train_mask]
-
-        data.batch_size = data.ego_ptr.size(0)
+            data.batch_size = data.ego_ptr.size(0)
         return data
 
 
@@ -74,21 +75,39 @@ class EgoGraphLoader(DataLoader):
                  undirected: bool = False,
                  **kwargs):
         self.collator = collator
+        self.to_single_layer = collator.to_single_layer
+        self.num_groups = collator.num_groups
+
         self.undirected = undirected
 
         if node_idx.dtype == torch.bool:
             node_idx = node_idx.nonzero(as_tuple=False).view(-1)
-        self.node_idx = node_idx
+
+        trans = [T.AddSelfLoops()]
+        if undirected:
+            trans.append(T.ToUndirected())
+        trans.append(T.ToSparseTensor())
+        self.transform = T.Compose(trans)
 
         super().__init__(node_idx.tolist(), collate_fn=self.__collate__, **kwargs)
 
     def __collate__(self, batch_nodes):
         batch_data = self.collator(batch_nodes)
+        batch_data.batch_size = len(batch_nodes)
+        delattr(batch_data, 'ptr')
 
-        trans = [T.AddSelfLoops()]
+        if self.to_single_layer:
+            return self.transform(batch_data)
+
+        edge_index = batch_data.edge_index.unique(dim=-1)
+
+        num_expand = batch_data.num_nodes * self.num_groups
+        edge_index = add_self_loops(edge_index, num_nodes=num_expand)[0]
+
         if self.undirected:
-            trans.append(T.ToUndirected())
-        transform = T.Compose(trans + base_trans)
-        return transform(batch_data)
+            edge_index = to_undirected(edge_index)
 
-
+        batch_data.adj_t = SparseTensor(row=edge_index[1], col=edge_index[0],
+                                        sparse_sizes=(num_expand, num_expand))
+        delattr(batch_data, 'edge_index')
+        return batch_data

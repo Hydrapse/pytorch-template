@@ -1,3 +1,9 @@
+import sys
+
+from src.datamodules.components.data import get_data
+
+sys.path.append('/home/xhh/notebooks/GNN/pytorch-template')
+
 import dotenv
 import hydra
 from omegaconf import DictConfig

@@ -65,7 +65,7 @@ class MNISTDataModule(LightningDataModule):
         This method is called by lightning twice for `trainer.fit()` and `trainer.test()`, so be careful if you do a random split!
         The `stage` can be used to differentiate whether it's called before trainer.fit()` or `trainer.test()`."""
 
-        # load datasets only if they're not loaded already
+        # load components only if they're not loaded already
         if not self.data_train and not self.data_val and not self.data_test:
             trainset = MNIST(self.hparams.data_dir, train=True, transform=self.transforms)
             testset = MNIST(self.hparams.data_dir, train=False, transform=self.transforms)

@@ -12,7 +12,7 @@ import torch_geometric.transforms as T
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import SAGEConv
 
-from src.datamodules.datasets.data import get_data
+from src.datamodules.components.data import get_data
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

@@ -1,6 +1,6 @@
 from torch.utils.data import DataLoader
 
-from src.models.components.assort_sampler import AdaptiveSampler
+from src.datamodules.components.sampler import AdaptiveSampler
 
 
 def sample_sub_graphs(batch_nodes, thresholds, model_s, q):
@@ -16,7 +16,6 @@ if __name__ == '__main__':
     from time import time
     from torch_geometric.datasets import Flickr
     import torch.multiprocessing as mp
-    import torch
     import torch_geometric.transforms as T
 
 
@@ -25,7 +24,7 @@ if __name__ == '__main__':
     batch_size = 64
 
     transform = T.Compose([T.ToUndirected(), T.AddSelfLoops()])
-    dataset = Flickr("/mnt/nfs-ssd/raw-datasets/pyg-format/Flickr", transform=transform)
+    dataset = Flickr("/mnt/nfs-ssd/raw-components/pyg-format/Flickr", transform=transform)
     data = dataset[0]
     node_index = data.train_mask.nonzero(as_tuple=False).view(-1)
     loader = DataLoader(node_index.tolist(), shuffle=True, batch_size=batch_size)

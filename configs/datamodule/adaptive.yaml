@@ -1,0 +1,26 @@
+_target_: src.datamodules.adapt_datamodule.AdaptDataModule
+
+data_dir: ${data_dir}/pyg-format
+dataset: cora
+split: full
+
+pin_memory: True
+num_workers: 15
+persistent_workers: True
+
+lr: 0.01
+weight_decay: 1e-4
+batch_size: 70
+undirected: False
+
+# AdaptiveSampler
+node_budget: 30
+alpha: 0.1
+p_gather: sum
+max_hop: 10
+min_nodes: 70
+num_groups: 1
+group_type: full
+ego_mode: False
+to_single_layer: False
+

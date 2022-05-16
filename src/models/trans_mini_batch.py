@@ -7,9 +7,9 @@ from torch_geometric.loader import ClusterData
 from tqdm import tqdm
 from torchmetrics import F1Score, Accuracy
 
-from components.gnn_backbone import GCN, GraphSAGE, GAT, GIN
-from src.datamodules.datasets.data import get_data
-from src.datamodules.datasets.loader import SaintRwLoader, NeighborLoader, ClusterLoader, ShadowLoader, to_sparse
+from components.backbone import GCN, GraphSAGE, GAT, GIN
+from src.datamodules.components.data import get_data
+from src.datamodules.components.loader import SaintRwLoader, NeighborLoader, ClusterLoader, ShadowLoader, to_sparse
 from src.utils.index import setup_seed, Dict, pred_fn, loss_fn
 
 
@@ -77,10 +77,10 @@ def main(hparams):
     metric.to(device)
 
     data, num_features, num_classes, processed_dir = get_data(name=hparams.dataset, split=hparams.split)
-    mask = data.train_mask.sum()
     kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 10, 'persistent_workers': True}
+    hparams.loader = hparams.loader.lower()
     if hparams.loader == 'sage':
-        kwargs.update({'num_neighbors': [5] * 2})
+        kwargs.update({'num_neighbors': [10] * 2})
         train_loader = NeighborLoader(data, input_nodes=data.train_mask, **kwargs)
     elif hparams.loader == 'cluster':
         cluster_data = ClusterData(data, num_parts=1500, save_dir=processed_dir)
@@ -125,24 +125,24 @@ if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
         # data
-        'dataset': 'citeseer',
+        'dataset': 'flickr',
         'split': 'full',
         'loader': 'sage',
         'batch_size': 256,
         # model
-        'hidden_dim': 128,
+        'hidden_dim': 256,
         'init_layers': 0,
         'conv_layers': 2,
         'dropout': 0.3,
         'dropedge': 0.,
-        'jk': 'last',
+        'jk': None,
         'residual': None,
         # training
         'seed': 123,
         'lr': 0.01,
         'weight_decay': 0,
         'grad_norm': None,
-        'epoch': 100,
+        'epoch': 20,
         'interval': 1,
         'metric': 'acc',  # micro
     })

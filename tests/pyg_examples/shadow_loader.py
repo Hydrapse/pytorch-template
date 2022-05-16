@@ -7,7 +7,7 @@ from torch_geometric.datasets import Flickr
 from torch_geometric.loader import ShaDowKHopSampler
 from torch_geometric.nn import SAGEConv, global_mean_pool
 
-from src.datamodules.datasets.data import get_data
+from src.datamodules.components.data import get_data
 from src.utils.index import dropout_edge
 
 data, num_features, num_classes, processed_dir = get_data('flickr')
