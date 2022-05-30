@@ -29,8 +29,8 @@ class MultGroupConv(nn.Module):
         expand_x = s.unsqueeze(-1) * x.unsqueeze(0)  # G * N * F
 
         # 与 adj 对齐: (G * batch_nodes * batch_size) * F
-        batch_size = int(batch.unique().numel() / self.num_groups)
-        expand_x = torch.cat([expand_x[:, batch == i, :].view(-1, self.in_channels)
+        batch_size = int(batch.unique().numel())
+        expand_x = torch.cat([expand_x[:, batch == i, :].view(-1, self.conv.in_channels)
                               for i in range(batch_size)])
         if p is not None:
             expand_x *= p.view(-1, 1)
@@ -63,7 +63,7 @@ class EgoGraphPooling(nn.Module):
         x = torch.cat([x_root] + xs, dim=-1)
 
         if self.num_groups > 1:
-            x = x.view(self.node_groups, -1, x.size(-1))  # G * batch_size * F
+            x = x.view(self.num_groups, -1, x.size(-1))  # G * batch_size * F
             x = torch.cat([x[i] for i in range(x.size(0))], dim=-1)  # batch_size * (F * G)
 
         return x

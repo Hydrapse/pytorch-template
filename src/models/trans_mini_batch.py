@@ -1,13 +1,17 @@
 import copy
+import sys
+from pytorch_lightning import seed_everything
+
+sys.path.append('/home/xhh/notebooks/GNN/pytorch-template')
+sys.path.append('/Users/synapse/Desktop/Repository/pycharm-workspace/pytorch-template')
 
 import torch
-import torch_geometric.transforms as T
 import numpy as np
 from torch_geometric.loader import ClusterData
 from tqdm import tqdm
 from torchmetrics import F1Score, Accuracy
 
-from components.backbone import GCN, GraphSAGE, GAT, GIN
+from components.backbone import GCN, GraphSAGE, GAT, GIN, PNA
 from src.datamodules.components.data import get_data
 from src.datamodules.components.loader import SaintRwLoader, NeighborLoader, ClusterLoader, ShadowLoader, to_sparse
 from src.utils.index import setup_seed, Dict, pred_fn, loss_fn
@@ -71,7 +75,7 @@ def mini_test(model, metric, *loaders):
 
 
 def main(hparams):
-    setup_seed(hparams.seed)
+    seed_everything(hparams.seed)
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     metric = F1Score(average='micro') if hparams.metric == 'micro' else Accuracy()
     metric.to(device)
@@ -80,23 +84,25 @@ def main(hparams):
     kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 10, 'persistent_workers': True}
     hparams.loader = hparams.loader.lower()
     if hparams.loader == 'sage':
-        kwargs.update({'num_neighbors': [10] * 2})
+        kwargs.update({'num_neighbors': [7] * 2})
         train_loader = NeighborLoader(data, input_nodes=data.train_mask, **kwargs)
+        val_loader = NeighborLoader(data, input_nodes=data.val_mask, **kwargs)
+        test_loader = NeighborLoader(data, input_nodes=data.test_mask, **kwargs)
     elif hparams.loader == 'cluster':
-        cluster_data = ClusterData(data, num_parts=1500, save_dir=processed_dir)
+        cluster_data = ClusterData(data, num_parts=20, save_dir=processed_dir)
         train_loader = ClusterLoader(cluster_data, **kwargs)
     elif hparams.loader == 'saint':
         train_loader = SaintRwLoader(data, walk_length=2, num_steps=5, sample_coverage=100,
                                      save_dir=processed_dir, **kwargs)
     elif hparams.loader == 'shadow':
-        kwargs.update({'depth': 4, 'num_neighbors': 10})
+        kwargs.update({'depth': 2, 'num_neighbors': 4})
         train_loader = ShadowLoader(data, node_idx=data.train_mask, **kwargs)
         val_loader = ShadowLoader(data, node_idx=data.val_mask, **kwargs)
         test_loader = ShadowLoader(data, node_idx=data.test_mask, **kwargs)
     else:
         raise NotImplementedError
 
-    if hparams.loader in ['ego', 'shadow']:
+    if hparams.loader in ['ego', 'shadow', 'sage']:
         test = lambda _model: mini_test(_model, metric, val_loader, test_loader)
     else:
         data = to_sparse(copy.copy(data)).to(device)
@@ -107,30 +113,45 @@ def main(hparams):
                       jk=hparams.jk, residual=hparams.residual).to(device)
 
     # runs
-    model.reset_parameters()
-    optimizer = torch.optim.Adam(model.parameters(), lr=hparams.lr, weight_decay=hparams.weight_decay)
-    best_val_acc = test_acc = 0
-    for epoch in range(1, hparams.epoch + 1):
-        loss, train_acc = train(model, optimizer, metric, train_loader, epoch, hparams.grad_norm)
-        print(f'Epoch {epoch:02d}, Loss: {loss:.4f}, Approx. Train: {train_acc:.4f}')
-        if epoch % hparams.interval == 0:
-            val_acc, tmp_test_acc = test(model)
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                test_acc = tmp_test_acc
-            print(f'Epoch: {epoch:03d}, Loss: {loss: .4f}, Val: {best_val_acc:.4f}, Test: {test_acc:.4f}')
+    runs = hparams.runs
+    best_val, best_test = [], []
+    for i in range(1, runs + 1):
+        model.reset_parameters()
+        optimizer = torch.optim.Adam(model.parameters(), lr=hparams.lr, weight_decay=hparams.weight_decay)
+
+        best_val_acc = test_acc = 0
+        test_accs = []
+        print(f'------------------------{i}------------------------')
+
+        for epoch in range(1, hparams.epoch + 1):
+            loss, train_acc = train(model, optimizer, metric, train_loader, epoch, hparams.grad_norm)
+            print(f'Epoch {epoch:02d}, Loss: {loss:.4f}, Approx. Train: {train_acc:.4f}')
+            if epoch % hparams.interval == 0:
+                val_acc, tmp_test_acc = test(model)
+                test_accs.append(round(tmp_test_acc.item(), 3))
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    test_acc = tmp_test_acc
+                print(f'Epoch: {epoch:02d}, Loss: {loss: .4f}, Val: {best_val_acc:.4f}, Test: {test_acc:.4f}')
+
+        best_val.append(float(best_val_acc))
+        best_test.append(float(test_acc))
+        print(test_accs)
+
+    print(f'Valid: {np.mean(best_val):.4f} +- {np.std(best_val):.4f}')
+    print(f'Test: {np.mean(best_test):.4f} +- {np.std(best_test):.4f}')
 
 
 if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
         # data
-        'dataset': 'flickr',
+        'dataset': 'citeseer',
         'split': 'full',
-        'loader': 'sage',
-        'batch_size': 256,
+        'loader': 'cluster',
+        'batch_size': 1,
         # model
-        'hidden_dim': 256,
+        'hidden_dim': 128,
         'init_layers': 0,
         'conv_layers': 2,
         'dropout': 0.3,
@@ -139,10 +160,11 @@ if __name__ == '__main__':
         'residual': None,
         # training
         'seed': 123,
-        'lr': 0.01,
+        'lr': 0.001,
         'weight_decay': 0,
         'grad_norm': None,
-        'epoch': 20,
+        'runs': 1,
+        'epoch': 40,
         'interval': 1,
         'metric': 'acc',  # micro
     })

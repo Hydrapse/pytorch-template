@@ -5,13 +5,24 @@ import torch_geometric.transforms as T
 from torch_geometric.data import Data, Batch
 from torch_geometric.datasets import (Planetoid, WikiCS, Coauthor, Amazon,
                                       GNNBenchmarkDataset, Yelp, Flickr,
-                                      Reddit2, PPI)
+                                      Reddit2, PPI, WebKB)
 
 
 def get_planetoid(root: str, name: str, split: str = 'public') -> Tuple[Data, int, int, str]:
     transform = T.Compose([T.NormalizeFeatures()])
     dataset = Planetoid(f'{root}/Planetoid', name, split, transform=transform)
     return dataset[0], dataset.num_features, dataset.num_classes, dataset.processed_dir
+
+
+def get_webkb(root: str, name: str) -> Tuple[Data, int, int, str]:
+    transform = T.Compose([T.NormalizeFeatures()])
+    dataset = WebKB(f'{root}/WebKB', name, transform=transform)
+    data = dataset[0]
+    split = 0
+    data.train_mask = data.train_mask[:, split]
+    data.val_mask = data.val_mask[:, split]
+    data.test_mask = data.test_mask[:, split]
+    return data, dataset.num_features, dataset.num_classes, dataset.processed_dir
 
 
 def get_wikics(root: str) -> Tuple[Data, int, int, str]:
@@ -75,6 +86,8 @@ def get_data(name: str, root: str = pyg_root, **kwargs) -> Tuple[Data, int, int,
         return get_planetoid(root, name, **kwargs)
     elif name.lower() == 'wikics':
         return get_wikics(root)
+    elif name.lower() in ['cornell', 'texas', 'wisconsin']:
+        return get_webkb(root, name)
     elif name.lower() in ['cluster', 'pattern']:
         return get_sbm(root, name)
     elif name.lower() == 'reddit':

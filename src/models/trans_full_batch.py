@@ -1,3 +1,9 @@
+import sys
+sys.path.append('/home/xhh/notebooks/GNN/pytorch-template')
+sys.path.append('/Users/synapse/Desktop/Repository/pycharm-workspace/pytorch-template')
+
+import numpy as np
+from pytorch_lightning import seed_everything
 from torch_geometric.datasets import Flickr, Reddit2, Planetoid
 import torch.nn.functional as F
 import torch
@@ -36,55 +42,65 @@ def test(model, metric, data):
 
 
 def main(hparams):
-    setup_seed(hparams.seed)
+    seed_everything(hparams.seed)
 
     # metric = torchmetrics.F1Score(average='micro')
     metric = torchmetrics.Accuracy()
 
-    data, num_features, num_classes, _  = get_data('cora', split='full')
+    data, num_features, num_classes, _ = get_data('cornell', split='full')
     to_sparse(data)
 
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     metric.to(device)
     data.to(device)
 
-    model = GCN(num_features, hparams.hidden_dim, hparams.conv_layers, num_classes,
-                init_layers=hparams.init_layers, dropout=hparams.dropout, dropedge=hparams.dropedge,
-                jk=hparams.jk, residual=hparams.residual).to(device)
+    model = GraphSAGE(num_features, hparams.hidden_dim, hparams.conv_layers, num_classes,
+                      init_layers=hparams.init_layers, dropout=hparams.dropout, dropedge=hparams.dropedge,
+                      jk=hparams.jk, residual=hparams.residual).to(device)
 
     # per run
-    model.reset_parameters()
-    optimizer = torch.optim.Adam(model.parameters(), lr=hparams.lr, weight_decay=hparams.weight_decay)
-    best_val_acc = test_acc = 0
-    for epoch in range(1, hparams.epoch):
-        loss = train(model, optimizer, data, hparams.grad_norm)
-        train_acc, val_acc, tmp_test_acc = test(model, metric, data)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            test_acc = tmp_test_acc
-        print(f'Epoch: {epoch:03d}, Loss: {loss: .4f}, Train: {train_acc:.4f}, '
-              f'Val: {best_val_acc:.4f}, Test: {test_acc:.4f}')
+    runs = hparams.runs
+    best_val, best_test = [], []
+    for i in range(1, runs + 1):
+        model.reset_parameters()
+        optimizer = torch.optim.Adam(model.parameters(), lr=hparams.lr, weight_decay=hparams.weight_decay)
+
+        print(f'------------------------{i}------------------------')
+        best_val_acc = test_acc = 0
+        for epoch in range(1, hparams.epoch):
+            loss = train(model, optimizer, data, hparams.grad_norm)
+            train_acc, val_acc, tmp_test_acc = test(model, metric, data)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                test_acc = tmp_test_acc
+            print(f'Epoch: {epoch:03d}, Loss: {loss: .4f}, Train: {train_acc:.4f}, '
+                  f'Val: {best_val_acc:.4f}, Test: {test_acc:.4f}')
+
+        best_val.append(float(best_val_acc))
+        best_test.append(float(test_acc))
+
+    print(f'Valid: {np.mean(best_val):.4f} +- {np.std(best_val):.4f}')
+    print(f'Test: {np.mean(best_test):.4f} +- {np.std(best_test):.4f}')
 
 
 if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
-        'hidden_dim': 128,
+        'hidden_dim': 16,
         'init_layers': 0,
         'conv_layers': 2,
-        'dropout': 0.3,
+        'dropout': 0.5,
         'dropedge': 0.,
-        'jk': 'last',
-        'residual': None,
+        'jk': None,
+        'residual': 'sum',
         'lr': 0.01,
         'weight_decay': 0,
         'grad_norm': None,
-        'epoch': 100,
+        'runs': 5,
+        'epoch': 300,
         'seed': 123,
     })
 
     main(params)
 
     print(params)
-
-

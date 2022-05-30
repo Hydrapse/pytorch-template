@@ -146,7 +146,7 @@ class AdaptiveSampler(nn.Module):
                 batch_list.append(Data(x, edge_index, p=data.p, ego_ptr=ego_mask,
                                        batch_index=data.batch, hop=data.hop))
             else:
-                e_id, n_id, n_p, e_batch, n_batch, hop = self.batch_wise_sampling(batch_nodes, x, g)
+                e_id, n_id, n_p, e_batch, n_batch, hop, nmd = self.batch_wise_sampling(batch_nodes, x, g)
                 e_full.append(e_id)
                 n_full.append(n_id)
                 n_p_full.append(n_p)
@@ -157,7 +157,6 @@ class AdaptiveSampler(nn.Module):
                 hop_full += hop
 
         if self.to_single_layer:
-
             batch_data = Batch.from_data_list(batch_list)
             batch_data.y = self.y[batch_nodes]
             batch_data.hop = batch_data.hop.to(float).view(-1, batch_size).mean(dim=0)
@@ -195,11 +194,17 @@ class AdaptiveSampler(nn.Module):
         batch_data.y = self.y[batch_nodes]
         batch_data.hop = hop_full / self.num_groups
 
+        batch_data.nmd = F.pad(torch.tensor(nmd), (0, self.max_hop-len(nmd)))  # TODO:
+
         batch_data.ego_ptr += batch_data.ptr[:-1]
         delattr(batch_data, 'num_groups')
         return batch_data
 
     def batch_wise_sampling(self, batch_nodes, x, g):
+
+        # TODO： 统计数据
+        num_nodes_dist = []
+
         batch_size = len(batch_nodes)
         h_roots = x[batch_nodes] * self.w_ego_root[g] + self.bias[g]
         # thresholds = F.relu(x[batch_nodes] @ self.w_threshold[g]).view(-1)
@@ -223,7 +228,7 @@ class AdaptiveSampler(nn.Module):
 
             num_nodes_list = torch.zeros_like(batch_nodes)
             idxs, invs, ptrs, inc = [], [], [], [0]
-            row = torch.cat([row, torch.Tensor([len(v)]).to(int)])  # 多拼接一位方便索引
+            row = torch.cat([row, torch.Tensor([len(v)]).to(int)])  # 多拼接一位方便索引 TODO：可优化
             for bn in remain_batch:
                 bn_mask = batch_ptr == bn
                 ptr = bn_mask.nonzero(as_tuple=True)[0]
@@ -235,6 +240,8 @@ class AdaptiveSampler(nn.Module):
                 inc.append(inc[-1] + len(idx))
                 num_nodes_list[bn] = len(idx)
             u_idx, edge_inv, batch_ptr = torch.cat(idxs), torch.cat(invs), torch.cat(ptrs)
+
+            num_nodes_dist.append(num_nodes_list.sum().item())  # TODO:
 
             """计算p_u"""
             # alpha = 0.1
@@ -292,7 +299,7 @@ class AdaptiveSampler(nn.Module):
             """不受budget、hop控制的threshold"""
             # p_u -= threshold  # 为了让threshold可导, 自适应 threshold
             # mask = mask & (p_u > 0)
-            p_u = p_u[mask] / hop[batch_ptr][mask] - self.alpha + 1
+            p_u = p_u[mask] / hop[batch_ptr][mask] - self.alpha + 1  # / hop[batch_ptr][mask]
 
             """保存当前层采样节点"""
             e_id.append(layer_e[mask[edge_inv]])
@@ -314,7 +321,7 @@ class AdaptiveSampler(nn.Module):
         e_batch, n_batch = torch.cat(e_batch), torch.cat(n_batch)
 
         if not self.to_single_layer:
-            return e_id, n_id, n_p, e_batch, n_batch, hop
+            return e_id, n_id, n_p, e_batch, n_batch, hop, num_nodes_dist
 
         egos = []
         for bn in range(batch_size):
