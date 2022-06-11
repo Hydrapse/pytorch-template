@@ -1,4 +1,5 @@
-from typing import Optional
+import time
+from typing import Optional, Union
 
 import torch
 import torch_geometric.transforms as T
@@ -8,7 +9,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import ClusterLoader as ClusterL, NeighborLoader as NeighborL, \
     GraphSAINTRandomWalkSampler, ShaDowKHopSampler
 from torch_geometric.transforms import BaseTransform
-from torch_geometric.utils import to_undirected, add_self_loops
+from torch_geometric.utils import to_undirected, add_self_loops, subgraph
 from torch_sparse import SparseTensor
 
 from src.datamodules.components.sampler import AdaptiveSampler
@@ -73,10 +74,12 @@ class EgoGraphLoader(DataLoader):
     def __init__(self, node_idx: Optional[Tensor],
                  collator: AdaptiveSampler = None,
                  undirected: bool = False,
+                 device: Optional[Union[str, torch.device]] = 'cpu',
                  **kwargs):
         self.collator = collator
         self.to_single_layer = collator.to_single_layer
         self.num_groups = collator.num_groups
+        self.device = device
 
         self.undirected = undirected
 
@@ -92,9 +95,15 @@ class EgoGraphLoader(DataLoader):
         super().__init__(node_idx.tolist(), collate_fn=self.__collate__, **kwargs)
 
     def __collate__(self, batch_nodes):
+        # start_time = time.perf_counter()
+
         batch_data = self.collator(batch_nodes)
         batch_data.batch_size = len(batch_nodes)
         delattr(batch_data, 'ptr')
+
+        # print(f'Total:{time.perf_counter() - start_time:.2f}s')
+
+        batch_data.to(self.device if self.num_workers == 0 else 'cpu')
 
         if self.to_single_layer:
             return self.transform(batch_data)

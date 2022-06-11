@@ -1,15 +1,20 @@
+import copy
 import math
+import time
+from typing import Optional, Union
 
 import torch
 from torch import nn
+from torch import tensor
 from torch.nn import Parameter, init
 import torch.nn.functional as F
-from torch_geometric.utils import add_remaining_self_loops, sort_edge_index
+from torch_geometric.utils import add_remaining_self_loops, sort_edge_index, subgraph
 from torch_scatter import scatter
 from torch_sparse import SparseTensor, matmul
 
 from torch_geometric.data import Batch, Data
 
+from src.utils.index import mask_to_index
 from src.utils.outliers import clip_int, replace_nan
 
 
@@ -37,34 +42,45 @@ class AdaptiveSampler(nn.Module):
             alpha: float = 0.5,
             p_gather: str = 'sum',  # sum, mean, max, min
             max_hop: int = 10,
+            max_degree: int = 32,
             min_nodes: int = 10,  # 最小下一层节点数
             num_groups: int = 2,
             group_type: str = 'full',  # full, split
             ego_mode: bool = False,  # 使用比较慢的ego-wise构造root graph
-            to_single_layer: bool = False  # 是否将下游模型看做单层GNN
+            to_single_layer: bool = False,  # 是否将下游模型看做单层GNN
+            # device: torch.device = 'cpu',
     ):
         super().__init__()
 
-        self.x = data.x
-        self.y = data.y
-        self.device = data.x.device
-        self.num_features = data.num_features
+        self.device = 'cpu'
+        self.data_device = 'cpu'
+
+        data = copy.copy(data).to(self.data_device)
+        self.data = data
+
+        # 用于计算采样概率的特征矩阵，在gpu中计算较快
+        self.x = data.x.to(self.device)
+
+        # 拓扑结构，在cpu中计算较快
         self.edge_index = add_remaining_self_loops(data.edge_index)[0]
-        row, col = self.edge_index.cpu()
+        row, col = self.edge_index
         self.adj_t = SparseTensor(
             row=row, col=col,
-            value=torch.arange(col.size(0)),  # .to(self.device)
+            value=torch.arange(col.size(0)).to(self.data_device),
             sparse_sizes=(data.num_nodes, data.num_nodes)).t()
 
+        # 分组模式
         if ego_mode and not to_single_layer:
             raise NotImplementedError
         if num_groups == 1:
             group_type = 'full'
 
+        self.num_features = data.num_features
         self.node_budget = node_budget
         self.alpha = alpha
         self.p_gather = p_gather
         self.max_hop = max_hop
+        self.max_degree = max_degree
         self.min_nodes = min_nodes
         self.num_groups = num_groups
         self.group_type = group_type
@@ -101,6 +117,12 @@ class AdaptiveSampler(nn.Module):
 
         self.reset_parameters()
 
+    def to(self, device: Optional[Union[int, str, torch.device]], *args, **kwargs):
+        super().to(device, *args, **kwargs)
+
+        self.x = self.x.to(device)
+        self.device = device
+
     def reset_parameters(self):
         for g in range(self.num_groups):
             bound = 1.0 / math.sqrt(self.num_features[g])
@@ -118,14 +140,15 @@ class AdaptiveSampler(nn.Module):
                 # torch.nn.init.uniform_(w, 0, 1e-6)
 
     def forward(self, batch_nodes):
-        batch_nodes = torch.tensor(batch_nodes)
+        device = self.data_device
+        batch_nodes = tensor(batch_nodes, device=device)
         batch_size = len(batch_nodes)
 
         batch_list = []
         e_full, n_full, n_p_full = [], [], []
         e_batch_full, n_batch_full = [], []
         e_ptr, n_ptr = [], []
-        hop_full = torch.zeros(batch_size, dtype=torch.int)
+        hop_full = torch.zeros(batch_size, dtype=torch.int, device=device)
         for g in range(self.num_groups):
             x = self.x if self.group_type == 'full' else self.x[:, self.x_ptr[g]:self.x_ptr[g+1]]
 
@@ -152,13 +175,13 @@ class AdaptiveSampler(nn.Module):
                 n_p_full.append(n_p)
                 e_batch_full.append(e_batch)
                 n_batch_full.append(n_batch)
-                e_ptr.append(torch.full((len(e_id),), g))
-                n_ptr.append(torch.full((len(n_id),), g))
-                hop_full += hop
+                e_ptr.append(torch.full((len(e_id),), g, device=device))
+                n_ptr.append(torch.full((len(n_id),), g, device=device))
+                hop_full += hop.to(device)
 
         if self.to_single_layer:
             batch_data = Batch.from_data_list(batch_list)
-            batch_data.y = self.y[batch_nodes]
+            batch_data.y = self.data.y[batch_nodes]
             batch_data.hop = batch_data.hop.to(float).view(-1, batch_size).mean(dim=0)
 
             batch_data.batch = batch_data.batch_index
@@ -170,78 +193,104 @@ class AdaptiveSampler(nn.Module):
         e_batch_full, n_batch_full = torch.cat(e_batch_full), torch.cat(n_batch_full)
         e_ptr, n_ptr = torch.cat(e_ptr), torch.cat(n_ptr)
 
-        egos = []
+        # start_time = time.perf_counter()
+
+        expand_num_nodes = 0
+        egos, p_idx, expand_n_full = [tensor([])] * batch_size, [tensor([])] * batch_size, [tensor([])] * batch_size
         for bn in range(batch_size):
             bn_mask = n_batch_full == bn
             be_mask = e_batch_full == bn
-
             n_idx, local_n = n_full[bn_mask].unique(return_inverse=True)
             num_nodes = n_idx.size(0)
             root_ptr = local_n[0]
 
-            expand_n = local_n + n_ptr[bn_mask] * num_nodes
-            p = scatter(n_p_full[bn_mask], expand_n, reduce=self.p_gather)
-            p = F.pad(p, (0, self.num_groups * num_nodes - p.size(0)))
+            p_idx[bn] = mask_to_index(bn_mask)
+            expand_n_full[bn] = local_n + n_ptr[bn_mask] * num_nodes + expand_num_nodes  # 全局视角下的节点id
+            expand_num_nodes += self.num_groups * num_nodes
+            # expand_n = local_n + n_ptr[bn_mask] * num_nodes
+            # p = scatter(n_p_full[bn_mask], expand_n, dim_size=self.num_groups * num_nodes, reduce=self.p_gather)
 
-            local_e = sort_edge_index(self.edge_index[:, e_full[be_mask]].unique(return_inverse=True)[1])
+            # TODO: subgraph only for group=1
+            # expand_e = subgraph(n_idx, self.edge_index, relabel_nodes=True)[0]
+
+            local_e = self.edge_index[:, e_full[be_mask]].unique(return_inverse=True)[1]
+            # local_e = sort_edge_index(local_e, num_nodes=num_nodes)
             expand_e = local_e + e_ptr[be_mask] * num_nodes
 
-            ego_data = EgoData(self.x[n_idx], expand_e, p, self.num_groups, ego_ptr=root_ptr)
-            ego_data.group_ptr = torch.arange(num_nodes).expand(self.num_groups, -1).reshape(-1)
-            egos.append(ego_data)
+            ego_data = EgoData(self.data.x[n_idx], expand_e, num_groups=self.num_groups, ego_ptr=root_ptr)
+            ego_data.group_ptr = torch.arange(num_nodes, device=device).expand(self.num_groups, -1).reshape(-1)
+            egos[bn] = ego_data
+
+        # print(f'Construct Ego Graph:{time.perf_counter() - start_time:.2f}s')
+
+        p_idx, expand_n_full = torch.cat(p_idx), torch.cat(expand_n_full)
+        p = scatter(n_p_full[p_idx], expand_n_full, dim_size=expand_num_nodes, reduce=self.p_gather)
 
         batch_data = Batch.from_data_list(egos)
-        batch_data.y = self.y[batch_nodes]
+        batch_data.p = p
+        batch_data.y = self.data.y[batch_nodes]
         batch_data.hop = hop_full / self.num_groups
 
-        batch_data.nmd = F.pad(torch.tensor(nmd), (0, self.max_hop-len(nmd)))  # TODO:
+        batch_data.nmd = F.pad(tensor(nmd), (0, self.max_hop-len(nmd)))  # TODO:
 
-        batch_data.ego_ptr += batch_data.ptr[:-1]
+        batch_data.ego_ptr += batch_data.ptr[:-1].to(device)
         delattr(batch_data, 'num_groups')
         return batch_data
 
     def batch_wise_sampling(self, batch_nodes, x, g):
+        num_nodes_dist = []  # TODO： 统计数据
 
-        # TODO： 统计数据
-        num_nodes_dist = []
+        in0 = in1 = in2 = 0
 
+        device = self.data_device
         batch_size = len(batch_nodes)
         h_roots = x[batch_nodes] * self.w_ego_root[g] + self.bias[g]
         # thresholds = F.relu(x[batch_nodes] @ self.w_threshold[g]).view(-1)
-        # print(thresholds)
 
         # 初始化batch图 边、节点、权重; 初始化边、节点对应batch_node
-        e_id, n_id, n_p = [torch.Tensor([]).to(int)], [batch_nodes], [torch.ones(batch_size)]
-        e_batch, n_batch = [torch.Tensor([]).to(int)], [torch.arange(batch_size)]
+        e_id, n_id, n_p = [tensor([], device=device).to(int)], [batch_nodes], [torch.ones(batch_size, device=device)]
+        e_batch, n_batch = [tensor([], device=device).to(int)], [torch.arange(batch_size, device=device)]
 
         # 开始迭代
-        budgets = torch.full((batch_size,), self.node_budget)
-        hop = torch.zeros(batch_size, dtype=torch.int)
+        budgets = torch.full((batch_size,), self.node_budget, device=device)
+        hop = torch.zeros(batch_size, dtype=torch.int, device=device)
         v, batch_ptr = batch_nodes, n_batch[0]
         while sum(budgets) > 0 and len(v) > 0:
-            remain_batch = batch_ptr.unique().tolist()
+            remain_batch = batch_ptr.unique()
+            bs = remain_batch.size(0)
             hop[remain_batch] += 1
 
-            adj_t, u = self.adj_t.sample_adj(v, -1, replace=False)
+            # TODO：  self.max_degree if self.training else -1
+            adj_t, u = self.adj_t.sample_adj(v, self.max_degree if self.training else -1, replace=False)
             row, col, layer_e = adj_t.coo()
-            adj = SparseTensor(row=col, col=row, sparse_sizes=adj_t.sparse_sizes()[::-1])
+            col = u[col]
+            # row, col, layer_e = self.adj_t[v, :].coo()
 
-            num_nodes_list = torch.zeros_like(batch_nodes)
-            idxs, invs, ptrs, inc = [], [], [], [0]
-            row = torch.cat([row, torch.Tensor([len(v)]).to(int)])  # 多拼接一位方便索引 TODO：可优化
-            for bn in remain_batch:
+            time_start = time.perf_counter()
+
+            idxs, invs, ptrs  = [tensor([])] * bs, [tensor([])] * bs, [tensor([])] * bs
+            num_nodes_list, inc = [0] * batch_size, [0] * (bs + 1),
+            for i, bn in enumerate(remain_batch):
+                # 计算当前bn对于边集[row,col]的"起始下标"与"末尾下标+1"
                 bn_mask = batch_ptr == bn
                 ptr = bn_mask.nonzero(as_tuple=True)[0]
-                start, end = (row == ptr[0]).nonzero()[0], (row == ptr[-1] + 1).nonzero()[0]
-                idx, inv = torch.unique(col[start:end], return_inverse=True)
-                idxs.append(idx)
-                invs.append(inv + inc[-1])
-                ptrs.append(torch.full((len(idx),), bn))
-                inc.append(inc[-1] + len(idx))
-                num_nodes_list[bn] = len(idx)
-            u_idx, edge_inv, batch_ptr = torch.cat(idxs), torch.cat(invs), torch.cat(ptrs)
+                start, end = (row == ptr[0]).nonzero()[0], (row == ptr[-1]).nonzero()[-1] + 1
 
-            num_nodes_dist.append(num_nodes_list.sum().item())  # TODO:
+                idx, inv = torch.unique(col[start:end], return_inverse=True)
+
+                idxs[i] = idx
+                invs[i] = inv + inc[i]
+                ptrs[i] = torch.full((len(idx),), bn, device=device)
+
+                num_nodes = len(idx)
+                num_nodes_list[bn] = num_nodes
+                inc[i + 1] = inc[i] + num_nodes
+
+            u_idx, edge_inv, batch_ptr = torch.cat(idxs), torch.cat(invs), torch.cat(ptrs)
+            num_nodes_dist.append(sum(num_nodes_list))
+
+            in0 += time.perf_counter() - time_start
+            time_start = time.perf_counter()
 
             """计算p_u"""
             # alpha = 0.1
@@ -253,9 +302,16 @@ class AdaptiveSampler(nn.Module):
             # layer_score = self.layer_kernel(x[v], x[u], adj, g, hop[pre])[u_idx]
 
             h_v = x[v] * self.w_layer_v[g].view(-1)
-            h_u = x[u] * self.w_ego_u[g] + matmul(adj, h_v, reduce='sum')
-            p_u = self.cos(h_roots[batch_ptr], h_u[u_idx] / num_nodes_list[batch_ptr].view(-1, 1))
-            p_u *= self.alpha
+            h_u = x[u_idx] * self.w_ego_u[g] + scatter(h_v[row], edge_inv.to(self.device), dim=0, reduce='sum')
+            # matmul(adj, h_v, reduce='sum')
+            num_batch_nodes = tensor(num_nodes_list, device=self.device)[batch_ptr].view(-1, 1)
+            p_u = self.alpha * self.cos(h_roots[batch_ptr], h_u / num_batch_nodes)
+            # + (torch.rand((batch_ptr.shape[0], ), device=self.device) * 2 - 1) * 1e-3)
+
+            p_u = p_u.to(device)
+
+            in1 += time.perf_counter() - time_start
+            time_start = time.perf_counter()
 
             # ego_score = F.relu(h_roots[batch_ptr] + h_msg).sum(dim=-1)  # * self.n_imp[u[u_idx]]
             # ego_score = self.cos(h_roots[batch_ptr], x[u[u_idx]] * self.w_ego_u[g])
@@ -277,24 +333,32 @@ class AdaptiveSampler(nn.Module):
             # pre_budgets = budgets.clone()
             """计算mask"""
             p_clip = torch.abs(p_u - self.alpha + 1)
-            mask = torch.zeros((u_idx.size(0),), dtype=torch.bool)
+            num_samples = p_clip.tolist()
+            sample_index = [tensor([])] * bs
             terminate_idx = []  # 开销用完，不会参与下一阶段计算
             for i, bn in enumerate(remain_batch):
                 start, end = inc[i], inc[i+1]
-                num_sample = p_clip[start:end].sum().item()
-                # print(end-start, num_sample)
+
+                # 计算采样个数
+                num_sample = sum(num_samples[start:end])
                 if num_sample < 1:  # 权重太小，这层不采样
                     hop[bn] -= 1
                     continue
                 num_sample = min(round(num_sample), budgets[bn])
 
-                mask[start:end][torch.multinomial(p_clip[start:end], num_sample)] = 1
+                # 节点采样
+                sample_index[i] = torch.multinomial(p_clip[start:end], num_sample).add(inc[i])
                 budgets[bn] -= num_sample
 
                 # 如果开销耗尽, 则下一层v中不包含该batch（这一层还是包含的）
                 if budgets[bn] <= 0 or hop[bn] >= self.max_hop:
                     terminate_idx.append(torch.arange(start, end))
-            # print(f'Hop: {hop.tolist()} \nFull: {num_nodes_list.tolist()} \nSamp: {(pre_budgets-budgets).tolist()}')
+
+            mask = torch.zeros((u_idx.size(0),), dtype=torch.bool, device=device, requires_grad=False)
+            sample_index = torch.cat(sample_index).to(torch.long)
+            mask.index_fill_(0, sample_index, 1)
+
+            in2 += time.perf_counter() - time_start
 
             """不受budget、hop控制的threshold"""
             # p_u -= threshold  # 为了让threshold可导, 自适应 threshold
@@ -303,7 +367,7 @@ class AdaptiveSampler(nn.Module):
 
             """保存当前层采样节点"""
             e_id.append(layer_e[mask[edge_inv]])
-            n_id.append(u[u_idx][mask])
+            n_id.append(u_idx[mask])
             n_p.append(p_u)
             e_batch.append(batch_ptr[edge_inv][mask[edge_inv]])
             n_batch.append(batch_ptr[mask])
@@ -312,18 +376,21 @@ class AdaptiveSampler(nn.Module):
             if len(terminate_idx) > 0:
                 mask = mask.clone()  # 为了不影响反向传播
                 mask[torch.cat(terminate_idx)] = 0
-            if sum(mask).item() < self.min_nodes:  # 提前终止
+            if mask.sum() < self.min_nodes:  # 提前终止
                 break
 
-            v, batch_ptr = u[u_idx][mask], batch_ptr[mask]
+            v, batch_ptr = u_idx[mask], batch_ptr[mask]
 
         e_id, n_id, n_p = torch.cat(e_id), torch.cat(n_id), torch.cat(n_p)
         e_batch, n_batch = torch.cat(e_batch), torch.cat(n_batch)
+
+        # print(f'batch unique: {in0:.2}s, PU: {in1:.2}s, Sample: {in2:.2}s')
 
         if not self.to_single_layer:
             return e_id, n_id, n_p, e_batch, n_batch, hop, num_nodes_dist
 
         egos = []
+        x = x.to(self.data_device)
         for bn in range(batch_size):
             bn_mask = n_batch == bn
             n_idx, inv_ptr = n_id[bn_mask].unique(return_inverse=True)
@@ -355,8 +422,8 @@ class AdaptiveSampler(nn.Module):
         e_id = []  # 存储所有边index
         # n_id = [batch_node.to(self.device)]
         n_id = [batch_node]  # 存储所有点index
-        # n_p = [torch.tensor([1.]).to(self.device)]
-        n_p = [torch.tensor([1.])]  # 储存所有点权重
+        # n_p = [tensor([1.]).to(self.device)]
+        n_p = [tensor([1.])]  # 储存所有点权重
 
         p_norm = float('-inf')
         budget = self.node_budget
@@ -473,6 +540,6 @@ class AdaptiveSampler(nn.Module):
                 (n_id == edge[1]).nonzero(as_tuple=True)[0]
             ])
 
-        batch_idx = torch.tensor(batch_idx).t()
+        batch_idx = tensor(batch_idx).t()
         val, idx = torch.sort(batch_idx[0])
         return torch.stack([val, batch_idx[1][idx]])

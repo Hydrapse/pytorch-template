@@ -47,7 +47,7 @@ def main(hparams):
     # metric = torchmetrics.F1Score(average='micro')
     metric = torchmetrics.Accuracy()
 
-    data, num_features, num_classes, _ = get_data('cornell', split='full')
+    data, num_features, num_classes, _ = get_data('pubmed', split='full')
     to_sparse(data)
 
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
@@ -86,7 +86,7 @@ def main(hparams):
 if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
-        'hidden_dim': 16,
+        'hidden_dim': 128,
         'init_layers': 0,
         'conv_layers': 2,
         'dropout': 0.5,

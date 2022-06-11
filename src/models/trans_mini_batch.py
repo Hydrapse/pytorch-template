@@ -76,7 +76,7 @@ def mini_test(model, metric, *loaders):
 
 def main(hparams):
     seed_everything(hparams.seed)
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     metric = F1Score(average='micro') if hparams.metric == 'micro' else Accuracy()
     metric.to(device)
 
@@ -84,7 +84,7 @@ def main(hparams):
     kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 10, 'persistent_workers': True}
     hparams.loader = hparams.loader.lower()
     if hparams.loader == 'sage':
-        kwargs.update({'num_neighbors': [7] * 2})
+        kwargs.update({'num_neighbors': [9] * 2})
         train_loader = NeighborLoader(data, input_nodes=data.train_mask, **kwargs)
         val_loader = NeighborLoader(data, input_nodes=data.val_mask, **kwargs)
         test_loader = NeighborLoader(data, input_nodes=data.test_mask, **kwargs)
@@ -146,15 +146,15 @@ if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
         # data
-        'dataset': 'citeseer',
+        'dataset': 'pubmed',
         'split': 'full',
-        'loader': 'cluster',
-        'batch_size': 1,
+        'loader': 'sage',
+        'batch_size': 64,
         # model
         'hidden_dim': 128,
         'init_layers': 0,
         'conv_layers': 2,
-        'dropout': 0.3,
+        'dropout': 0.5,
         'dropedge': 0.,
         'jk': None,
         'residual': None,
@@ -163,8 +163,8 @@ if __name__ == '__main__':
         'lr': 0.001,
         'weight_decay': 0,
         'grad_norm': None,
-        'runs': 1,
-        'epoch': 40,
+        'runs': 5,
+        'epoch': 20,
         'interval': 1,
         'metric': 'acc',  # micro
     })

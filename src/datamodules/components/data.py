@@ -77,8 +77,8 @@ def get_sbm(root: str, name: str) -> Tuple[Data, int, int, str]:
     return data, dataset.num_features, dataset.num_classes, dataset.processed_dir
 
 
-# pyg_root = '/mnt/nfs-ssd/raw-datasets/pyg-format'
-pyg_root = '/Users/synapse/datasets/pyg-format'
+pyg_root = '/mnt/nfs-ssd/raw-datasets/pyg-format'
+# pyg_root = '/Users/synapse/datasets/pyg-format'
 
 
 def get_data(name: str, root: str = pyg_root, **kwargs) -> Tuple[Data, int, int, str]:

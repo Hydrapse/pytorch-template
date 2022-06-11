@@ -24,8 +24,13 @@ import torch
 # from src.models.components.gnn_backbone import GCN
 from src.datamodules.components.data import get_data
 from src.datamodules.components.loader import EgoGraphLoader
-from src.utils.index import setup_seed
 import numpy as np
+
+# from multiprocessing import set_start_method
+# try:
+#     set_start_method('spawn')
+# except RuntimeError:
+#     pass
 
 
 class Conv(SAGEConv):
@@ -145,12 +150,20 @@ def train(epoch, loader, model, optimizer, device):
         hops.append(batch.hop.to(torch.float).mean())
         stat_hop.append(batch.nmd.tolist())
 
+        # start_time = time.perf_counter()
+
         out = model(batch.x, batch.adj_t, batch.ego_ptr,
                     p=batch.p, batch=batch.batch, group_ptr=batch.group_ptr)
+
+        # print(f'Forward:{time.perf_counter() - start_time:.3f}s')
+        # start_time = time.perf_counter()
+
         loss = F.cross_entropy(out, batch.y)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # print(f'Optimize:{time.perf_counter() - start_time:.2f}s\n')
 
         total_loss += float(loss) * batch.batch_size
         total_correct += int((out.argmax(dim=-1) == batch.y).sum())
@@ -166,7 +179,7 @@ def train(epoch, loader, model, optimizer, device):
     stat_hop = torch.tensor(stat_hop).sum(dim=0).tolist()
 
     print(f'Epoch: {epoch:02d}, Avg Nodes {sum(nodes) / len(nodes):.0f}, '
-          f'Mean Hop: {mean_hop:.2f}, Stat Hop: {stat_hop}')
+          f'Mean Hop: {mean_hop:.2f}')
 
     return train_loss, train_acc, round(mean_hop, 2), stat_hop
 
@@ -192,49 +205,43 @@ def test(loader, model, device):
 
 
 def main():
-    runs, epochs, seed = 1, 20, 123
-    # setup_seed(seed)
+    runs, epochs, seed = 5, 20, 123
     seed_everything(seed, workers=True)
 
-    torch.autograd.set_detect_anomaly(False)
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
-
-    data, num_features, num_classes, processed_dir = get_data('cora', split='full')
+    # torch.autograd.set_detect_anomaly(False)
+    sampler_device = torch.device('cuda:1')
+    model_device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    data, num_features, num_classes, processed_dir = get_data('flickr', split='full')
 
     kwargs = {'batch_size': 64,
               # 'num_workers': 0,
               # 'persistent_workers': False,
-              'pin_memory': True,
               'shuffle': True,
-              'undirected': True  # 在pubmed效果好  # TODO：加上完整的子图
+              'undirected': True,
+              'device': model_device
               }
     batch_size = kwargs['batch_size']
 
     num_groups = 1
     single_layer = False
 
-    sampler = AdaptiveSampler(data, 50, max_hop=10, alpha=1, min_nodes=batch_size,
+    sampler = AdaptiveSampler(data, 80, alpha=0.3, max_hop=10, max_degree=32, min_nodes=batch_size,
                               p_gather='sum', num_groups=num_groups, group_type='full',
                               ego_mode=False, to_single_layer=single_layer)
-    num_features = sampler.feature_size
+
+    model = GraphSAGE(sampler.feature_size, 128, 2, num_classes, subg_pool=[-1], init_layers=0, dropout=0.5,
+                      residual=None, num_groups=num_groups, as_single_layer=single_layer, pool_type='max')
 
     train_loader = EgoGraphLoader(data.train_mask, sampler, **kwargs)
-    val_loader = EgoGraphLoader(data.val_mask, sampler, num_workers=0, persistent_workers=False, **kwargs)
-    test_loader = EgoGraphLoader(data.test_mask, sampler, num_workers=0, persistent_workers=False, **kwargs)
-
-    # model = GNN(num_features, 128, num_classes).to(device)
-    # params = list(sampler.parameters()) + list(model.parameters())
-    # optimizer = torch.optim.Adam(params, lr=0.01, weight_decay=0)
+    val_loader = EgoGraphLoader(data.val_mask, sampler, num_workers=15, persistent_workers=True, **kwargs)
+    test_loader = EgoGraphLoader(data.test_mask, sampler, num_workers=15, persistent_workers=True, **kwargs)
 
     best_val, best_test = [], []
     for i in range(1, runs + 1):
+        model.to(model_device)
         sampler.reset_parameters()
-        model = GCN(num_features, 128, 2, num_classes, subg_pool=[], init_layers=0, dropout=0.3, residual=None,
-                          num_groups=num_groups, as_single_layer=single_layer, pool_type='mean').to(device)
         model.reset_parameters()
-        # model = GNN(num_features, 128, num_classes, num_groups, single_layer).to(device)
-        # params = list(sampler.parameters()) + list(model.parameters())
-        # optimizer = torch.optim.Adam(params, lr=0.001, weight_decay=0)
+
         optimizer = torch.optim.Adam(
             [{'params': sampler.parameters(), 'lr': 0.001, 'weight_decay': 1e-5},
              {'params': model.parameters(), 'lr': 0.001}])
@@ -242,26 +249,24 @@ def main():
         print(f'------------------------{i}------------------------')
         best_val_acc = best_test_acc = 0
         test_accs, hops, stat_hops = [], [], []
-
         for epoch in range(1, epochs + 1):
-            # sampler.min_nodes = 70
-            # sampler.max_hop = 3
-            train_loss, train_acc, mean_hop, stat_hop = train(epoch, train_loader, model, optimizer, device)
+            sampler.to(sampler_device)
+            train_loss, train_acc, mean_hop, stat_hop = train(epoch, train_loader, model, optimizer, model_device)
             hops.append(mean_hop)
             stat_hops.append(stat_hop)
-            # sampler.max_hop = 10
-            # sampler.min_nodes = 0
+
             if epoch % 1 == 0 and epoch > 0:
+                sampler.to('cpu')  # 为了使用测试时并行加载数据
                 start_time = time.perf_counter()
-                val_acc, val_hop = test(val_loader, model, device)
-                tmp_test_acc, test_hop = test(test_loader, model, device)
+                val_acc, val_hop = test(val_loader, model, model_device)
+                tmp_test_acc, test_hop = test(test_loader, model, model_device)
                 test_accs.append(round(tmp_test_acc, 3))
                 # print(f'Val Hop: {sum(val_hop) / len(val_hop):.2f}, Test Hop: {sum(test_hop) / len(test_hop):.2f}')
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     best_test_acc = tmp_test_acc
                 print(f'Epoch: {epoch:02d}, Loss: {train_loss:.4f}, Train: {train_acc:.4f}, CurVal: {val_acc:.4f}, '
-                      f'Val: {best_val_acc:.4f}, Test: {best_test_acc:.4f}, '
+                      f'Val: {best_val_acc:.4f}, CurTest: {tmp_test_acc:.4f}, Test: {best_test_acc:.4f}, '
                       f'Time:{time.perf_counter() - start_time:.2f}s')
 
         best_val.append(best_val_acc)
