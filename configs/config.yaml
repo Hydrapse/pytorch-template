@@ -33,8 +33,9 @@ defaults:
 work_dir: ${hydra:runtime.cwd}
 
 # path to folder with data
-#data_dir: ${work_dir}/data/
-data_dir: /mnt/nfs-ssd/raw-datasets
+# lab: /mnt/nfs-ssd/raw-datasets
+# local: /Users/synapse/datasets
+data_dir: ${oc.env:DATA_DIR}
 
 # pretty print config at the start of the run using Rich library
 print_config: True

@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 import hydra
+import torch.backends.cudnn
 from omegaconf import DictConfig
 from pytorch_lightning import (
     Callback,
@@ -13,7 +14,6 @@ from pytorch_lightning.loggers import LightningLoggerBase
 
 from src import utils
 from src.datamodules.adapt_datamodule import AdaptDataModule
-from src.datamodules.components.data import get_data
 
 log = utils.get_logger(__name__)
 
@@ -42,12 +42,15 @@ def train(config: DictConfig) -> Optional[float]:
     if isinstance(datamodule, AdaptDataModule):
         config.model.num_groups = config.datamodule.num_groups
         config.model.as_single_layer = config.datamodule.to_single_layer
-    model: LightningModule = hydra.utils.instantiate(config.model,
-                                                     in_channels=datamodule.num_features,
-                                                     out_channels=datamodule.num_classes)
-    if isinstance(datamodule, AdaptDataModule):
-        # model.sampler = datamodule.sampler
+        model: LightningModule = hydra.utils.instantiate(config.model,
+                                                         sampler=datamodule.sampler,
+                                                         in_channels=datamodule.num_features,
+                                                         out_channels=datamodule.num_classes)
         model.sampler_conf = datamodule.optim_conf
+    else:
+        model: LightningModule = hydra.utils.instantiate(config.model,
+                                                         in_channels=datamodule.num_features,
+                                                         out_channels=datamodule.num_classes)
 
     # Init lightning callbacks
     callbacks: List[Callback] = []
@@ -95,10 +98,17 @@ def train(config: DictConfig) -> Optional[float]:
         )
     score = trainer.callback_metrics.get(optimized_metric)
 
+    # Log best model path
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    [logg.log_text('model/best_model_path', best_model_path) for logg in logger]
+
     # Test the model
     if config.get("test_after_training") and not config.trainer.get("fast_dev_run"):
         log.info("Starting testing!")
-        trainer.test(model=model, datamodule=datamodule, ckpt_path="best")
+        # retrieve best model
+        best_model = model.load_from_checkpoint(best_model_path)
+        datamodule.sampler = best_model.sampler
+        trainer.test(model=best_model, datamodule=datamodule)
 
     # Make sure everything closed properly
     log.info("Finalizing!")
@@ -113,7 +123,7 @@ def train(config: DictConfig) -> Optional[float]:
 
     # Print path to best checkpoint
     if not config.trainer.get("fast_dev_run"):
-        log.info(f"Best model ckpt at {trainer.checkpoint_callback.best_model_path}")
+        log.info(f"Best model ckpt at {best_model_path}")
 
     # Return metric score for hyperparameter optimization
     return score

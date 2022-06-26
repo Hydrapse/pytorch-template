@@ -30,6 +30,7 @@ class GNNModule(LightningModule):
         metric: str,
         lr: float,
         weight_decay: float,
+        sampler,
         **model_kwargs
     ):
         super().__init__()
@@ -37,6 +38,9 @@ class GNNModule(LightningModule):
         # this line allows accessing init params with 'self.hparams' attribute
         # it also ensures init params will be stored in ckpt
         self.save_hyperparameters(logger=False)
+
+        if sampler is not None:
+            self.sampler = sampler
 
         model = model.lower()
         if model == 'gcn':
@@ -70,13 +74,17 @@ class GNNModule(LightningModule):
         preds, y = pred_fn(logits, batch.y)
         return loss, preds, y
 
+    def on_train_epoch_start(self) -> None:
+        # self.sampler.to(self.device)  # 采样阶段使用gpu加速
+        self.sampler.to('cpu')
+
     def training_step(self, batch: Any, batch_idx: int):
         loss, preds, targets = self.step(batch)
 
         # log train metrics
         acc = self.train_acc(preds, targets)
-        self.log("train/loss", (loss/batch.batch_size).round(decimals=4), on_step=True, on_epoch=False, prog_bar=False)
-        self.log("train/acc", acc.round(decimals=4), on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train/loss", loss/batch.batch_size, on_step=True, on_epoch=False, prog_bar=False)
+        self.log("train/acc", acc, on_step=False, on_epoch=True, prog_bar=True)
 
         # we can return here dict with any tensors
         # and then read it in some callback or in `training_epoch_end()`` below
@@ -93,29 +101,29 @@ class GNNModule(LightningModule):
         hop /= len(outputs)
         num_nodes /= len(outputs)
 
-        self.log('train/hop', round(hop, 2), on_step=False, on_epoch=True)
-        self.log('train/nodes', round(num_nodes), on_step=False, on_epoch=True)
+        self.log('train/hop', round(hop, 2), prog_bar=True)
+        self.log('train/nodes', round(num_nodes), prog_bar=True)
 
     def validation_step(self, batch: Any, batch_idx: int):
         loss, preds, targets = self.step(batch)
+        self.val_acc(preds, targets)
 
-        acc = self.val_acc(preds, targets)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=False)
-        self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True)
-
         return {"loss": loss, "preds": preds, "targets": targets}
 
     def validation_epoch_end(self, outputs: List[Any]):
-        acc = self.val_acc.compute()  # get val accuracy from current epoch
+        acc = self.val_acc.compute()
+        self.log("val/acc", acc, prog_bar=True)
+
         self.val_acc_best.update(acc)
-        self.log("val/acc_best", self.val_acc_best.compute(), on_epoch=True, prog_bar=True)
+        best_acc = self.val_acc_best.compute()
+        self.log("val/acc_best", best_acc, prog_bar=True)
 
     def test_step(self, batch: Any, batch_idx: int):
         loss, preds, targets = self.step(batch)
 
-        acc = self.test_acc(preds, targets).round(decimals=4)
-        self.log("test/loss", loss.round(decimals=4), on_step=False, on_epoch=True)
-        self.log("test/acc", acc, on_step=False, on_epoch=True)
+        self.test_acc(preds, targets)
+        self.log("test/loss", loss, on_step=False, on_epoch=True)
 
         return {"loss": loss, "preds": preds, "targets": targets,
                 'num_nodes': batch.num_nodes, 'num_edges': batch.num_edges,
@@ -130,9 +138,10 @@ class GNNModule(LightningModule):
         hop /= len(outputs)
         num_nodes, num_edges = num_nodes / len(outputs),  num_edges / len(outputs)
 
-        self.log('test/hop', round(hop, 2), on_step=False, on_epoch=True)
-        self.log('test/nodes', round(num_nodes), on_step=False, on_epoch=True)
-        self.log('test/edges', round(num_edges), on_step=False, on_epoch=True)
+        self.log("test/acc", self.test_acc.compute(), prog_bar=True)
+        self.log('test/hop', round(hop, 2))
+        self.log('test/nodes', round(num_nodes))
+        self.log('test/edges', round(num_edges))
 
     def on_epoch_end(self):
         # reset metrics at the end of every epoch

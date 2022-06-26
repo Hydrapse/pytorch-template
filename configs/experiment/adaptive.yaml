@@ -18,33 +18,33 @@ defaults:
 
 # name of the run determines folder name in logs
 # can also be accessed by loggers
-name: "adaptive-sampler-1"
+name: "adaptive-sampler"
 
 seed: 123
 
 trainer:
   min_epochs: 0
-  max_epochs: 20
+  max_epochs: 2
 #  gradient_clip_val: 0.5
-  gpus: 0
+  gpus: [0]
 #  strategy: ddp
 
 datamodule:
-#  num_workers: 0
-#  persistent_workers: False
-
+  num_workers: 20
   # dataset
-  dataset: cora
-  batch_size: 70
-  undirected: False
+  dataset: pubmed
+  split: full
+  batch_size: 64
+  undirected: True
   # training
-  lr: 0.01
-  weight_decay: 1e-4
+  lr: 0.001
+  weight_decay: 1e-5
   # adapt
-  node_budget: 30
-  alpha: 0.1
+  node_budget: 50
+  alpha: 0.2
   max_hop: 10
-  min_nodes: 70
+  max_degree: 16
+  min_nodes: 64
   num_groups: 1
   group_type: full
   ego_mode: False
@@ -55,10 +55,11 @@ model:
   lr: 0.001
   # adapt
   subg_pool: []
-  pool_type: mean
+  pool_type: max
   # base
   hidden_channels: 128
   conv_layers: 2
+  dropout: 0.3
   dropedge: 0
   residual: null
   jk: null

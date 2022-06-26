@@ -31,6 +31,8 @@ import numpy as np
 #     set_start_method('spawn')
 # except RuntimeError:
 #     pass
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 
 class Conv(SAGEConv):
@@ -205,32 +207,32 @@ def test(loader, model, device):
 
 
 def main():
-    runs, epochs, seed = 5, 20, 123
+    runs, epochs, seed = 5, 40, 123
     seed_everything(seed, workers=True)
 
     # torch.autograd.set_detect_anomaly(False)
-    sampler_device = torch.device('cuda:1')
-    model_device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
-    data, num_features, num_classes, processed_dir = get_data('flickr', split='full')
+    sampler_device = torch.device('cuda:0')
+    model_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    data, num_features, num_classes, processed_dir = get_data('cora', split='full')
 
     kwargs = {'batch_size': 64,
               # 'num_workers': 0,
               # 'persistent_workers': False,
               'shuffle': True,
               'undirected': True,
-              'device': model_device
               }
     batch_size = kwargs['batch_size']
 
     num_groups = 1
     single_layer = False
 
-    sampler = AdaptiveSampler(data, 80, alpha=0.3, max_hop=10, max_degree=32, min_nodes=batch_size,
+    sampler = AdaptiveSampler(data, 50, alpha=0.2, max_hop=10, max_degree=-1, min_nodes=batch_size,
                               p_gather='sum', num_groups=num_groups, group_type='full',
-                              ego_mode=False, to_single_layer=single_layer)
+                              ego_mode=False, to_single_layer=single_layer).to(sampler_device)
 
-    model = GraphSAGE(sampler.feature_size, 128, 2, num_classes, subg_pool=[-1], init_layers=0, dropout=0.5,
-                      residual=None, num_groups=num_groups, as_single_layer=single_layer, pool_type='max')
+    model = GraphSAGE(sampler.feature_size, 128, 2, num_classes, init_layers=0, dropout=0.9, residual=None,
+                      num_groups=num_groups, subg_pool=[], as_single_layer=single_layer, pool_type='max'
+                      ).to(model_device)
 
     train_loader = EgoGraphLoader(data.train_mask, sampler, **kwargs)
     val_loader = EgoGraphLoader(data.val_mask, sampler, num_workers=15, persistent_workers=True, **kwargs)
@@ -238,7 +240,6 @@ def main():
 
     best_val, best_test = [], []
     for i in range(1, runs + 1):
-        model.to(model_device)
         sampler.reset_parameters()
         model.reset_parameters()
 
@@ -250,13 +251,13 @@ def main():
         best_val_acc = best_test_acc = 0
         test_accs, hops, stat_hops = [], [], []
         for epoch in range(1, epochs + 1):
-            sampler.to(sampler_device)
+            sampler.to(sampler_device)  # 为了使用测试时并行加载数据
             train_loss, train_acc, mean_hop, stat_hop = train(epoch, train_loader, model, optimizer, model_device)
             hops.append(mean_hop)
             stat_hops.append(stat_hop)
 
             if epoch % 1 == 0 and epoch > 0:
-                sampler.to('cpu')  # 为了使用测试时并行加载数据
+                # sampler.to('cpu')  # 为了使用测试时并行加载数据
                 start_time = time.perf_counter()
                 val_acc, val_hop = test(val_loader, model, model_device)
                 tmp_test_acc, test_hop = test(test_loader, model, model_device)
@@ -268,6 +269,7 @@ def main():
                 print(f'Epoch: {epoch:02d}, Loss: {train_loss:.4f}, Train: {train_acc:.4f}, CurVal: {val_acc:.4f}, '
                       f'Val: {best_val_acc:.4f}, CurTest: {tmp_test_acc:.4f}, Test: {best_test_acc:.4f}, '
                       f'Time:{time.perf_counter() - start_time:.2f}s')
+                # sampler.to(sampler_device)
 
         best_val.append(best_val_acc)
         best_test.append(best_test_acc)

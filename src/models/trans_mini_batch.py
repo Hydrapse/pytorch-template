@@ -1,4 +1,5 @@
 import copy
+import os
 import sys
 from pytorch_lightning import seed_everything
 
@@ -15,6 +16,7 @@ from components.backbone import GCN, GraphSAGE, GAT, GIN, PNA
 from src.datamodules.components.data import get_data
 from src.datamodules.components.loader import SaintRwLoader, NeighborLoader, ClusterLoader, ShadowLoader, to_sparse
 from src.utils.index import setup_seed, Dict, pred_fn, loss_fn
+from apex import amp
 
 
 def train(model, optimizer, metric, train_loader, epoch, grad_norm=None):
@@ -33,12 +35,16 @@ def train(model, optimizer, metric, train_loader, epoch, grad_norm=None):
         optimizer.zero_grad()
         y_hat = model(batch.x, batch.adj_t, batch.ego_ptr)
         loss = loss_fn(y_hat, batch.y)
+
+        # with amp.scale_loss(loss, optimizer) as scaled_loss:
+        #     scaled_loss.backward()
         loss.backward()
+
         if grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm)
         optimizer.step()
 
-        total_loss += float(loss) / batch.batch_size
+        total_loss += loss.item() / batch.batch_size
         metric.update(*pred_fn(y_hat, batch.y))
         pbar.update(batch.batch_size)
     pbar.close()
@@ -84,7 +90,7 @@ def main(hparams):
     kwargs = {'batch_size': hparams.batch_size, 'shuffle': True, 'num_workers': 10, 'persistent_workers': True}
     hparams.loader = hparams.loader.lower()
     if hparams.loader == 'sage':
-        kwargs.update({'num_neighbors': [9] * 2})
+        kwargs.update({'num_neighbors': [5] * 2})
         train_loader = NeighborLoader(data, input_nodes=data.train_mask, **kwargs)
         val_loader = NeighborLoader(data, input_nodes=data.val_mask, **kwargs)
         test_loader = NeighborLoader(data, input_nodes=data.test_mask, **kwargs)
@@ -119,6 +125,8 @@ def main(hparams):
         model.reset_parameters()
         optimizer = torch.optim.Adam(model.parameters(), lr=hparams.lr, weight_decay=hparams.weight_decay)
 
+        # model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+
         best_val_acc = test_acc = 0
         test_accs = []
         print(f'------------------------{i}------------------------')
@@ -146,7 +154,7 @@ if __name__ == '__main__':
     # torch.autograd.set_detect_anomaly(True)
     params = Dict({
         # data
-        'dataset': 'pubmed',
+        'dataset': 'cora',
         'split': 'full',
         'loader': 'sage',
         'batch_size': 64,
@@ -154,7 +162,7 @@ if __name__ == '__main__':
         'hidden_dim': 128,
         'init_layers': 0,
         'conv_layers': 2,
-        'dropout': 0.5,
+        'dropout': 0.9,
         'dropedge': 0.,
         'jk': None,
         'residual': None,
@@ -164,7 +172,7 @@ if __name__ == '__main__':
         'weight_decay': 0,
         'grad_norm': None,
         'runs': 5,
-        'epoch': 20,
+        'epoch': 50,
         'interval': 1,
         'metric': 'acc',  # micro
     })

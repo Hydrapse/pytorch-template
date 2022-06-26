@@ -123,6 +123,8 @@ class AdaptiveSampler(nn.Module):
         self.x = self.x.to(device)
         self.device = device
 
+        return self
+
     def reset_parameters(self):
         for g in range(self.num_groups):
             bound = 1.0 / math.sqrt(self.num_features[g])

@@ -8,7 +8,7 @@ weight_decay: 0.
 num_groups: 1
 as_single_layer: False
 subg_pool: [-1]  # 判断是否为AS的重要依据
-pool_type: mean  # max
+pool_type: max  # max
 
 hidden_channels: 128
 conv_layers: 2

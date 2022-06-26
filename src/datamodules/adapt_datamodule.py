@@ -75,7 +75,7 @@ class AdaptDataModule(LightningDataModule):
             self.hparams.undirected,
             batch_size=self.hparams.batch_size,
             shuffle=True,
-            pin_memory=self.hparams.pin_memory,
+            pin_memory=False,
             num_workers=0,
         )
 
@@ -88,17 +88,17 @@ class AdaptDataModule(LightningDataModule):
             shuffle=True,
             pin_memory=self.hparams.pin_memory,
             num_workers=self.hparams.num_workers,
-            persistent_workers=self.hparams.persistent_workers
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def test_dataloader(self):
         return EgoGraphLoader(
-            self.data.val_mask,
+            self.data.test_mask,
             self.sampler,
             self.hparams.undirected,
             batch_size=self.hparams.batch_size,
             shuffle=True,
             pin_memory=self.hparams.pin_memory,
             num_workers=self.hparams.num_workers,
-            persistent_workers=self.hparams.persistent_workers
+            persistent_workers=self.hparams.num_workers > 0,
         )

@@ -74,12 +74,10 @@ class EgoGraphLoader(DataLoader):
     def __init__(self, node_idx: Optional[Tensor],
                  collator: AdaptiveSampler = None,
                  undirected: bool = False,
-                 device: Optional[Union[str, torch.device]] = 'cpu',
                  **kwargs):
         self.collator = collator
         self.to_single_layer = collator.to_single_layer
         self.num_groups = collator.num_groups
-        self.device = device
 
         self.undirected = undirected
 
@@ -94,8 +92,21 @@ class EgoGraphLoader(DataLoader):
 
         super().__init__(node_idx.tolist(), collate_fn=self.__collate__, **kwargs)
 
+    def _get_device(self):
+        if self.num_workers > 0:
+            return torch.device('cpu')
+        else:
+            return self.collator.device
+
+    def __iter__(self):
+        # 在multi worker process创建或者reset之前，将sampler放入cpu中，避免多线程下使用gpu计算报错
+
+        self.collator.to(self._get_device())
+        return super().__iter__()
+
     def __collate__(self, batch_nodes):
         # start_time = time.perf_counter()
+        # self.collator.to(device)
 
         batch_data = self.collator(batch_nodes)
         batch_data.batch_size = len(batch_nodes)
@@ -103,7 +114,7 @@ class EgoGraphLoader(DataLoader):
 
         # print(f'Total:{time.perf_counter() - start_time:.2f}s')
 
-        batch_data.to(self.device if self.num_workers == 0 else 'cpu')
+        batch_data.to(self._get_device())
 
         if self.to_single_layer:
             return self.transform(batch_data)

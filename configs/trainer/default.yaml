@@ -9,3 +9,7 @@ resume_from_checkpoint: null
 
 # number of validation steps to execute at the beginning of the training
 num_sanity_val_steps: 0
+
+# make sure the result could be reproduced
+# 许多算子不支持deterministic，使得结果无法复现
+deterministic: False
