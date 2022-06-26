@@ -75,8 +75,8 @@ class GNNModule(LightningModule):
         return loss, preds, y
 
     def on_train_epoch_start(self) -> None:
-        # self.sampler.to(self.device)  # 采样阶段使用gpu加速
-        self.sampler.to('cpu')
+        self.sampler.to(self.device)  # 采样阶段使用gpu加速
+        # self.sampler.to('cpu')
 
     def training_step(self, batch: Any, batch_idx: int):
         loss, preds, targets = self.step(batch)
